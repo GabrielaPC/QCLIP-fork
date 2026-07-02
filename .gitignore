@@ -3,6 +3,7 @@ mlflow.deb
 .vscode/
 images/
 data/
+/.data 
 data_compact/
 results/
 text/
@@ -16,6 +17,7 @@ _*
 modules_v2/
 playground/
 notebooks/playground/
+/.*
 
 
 # Byte-compiled / optimized / DLL files

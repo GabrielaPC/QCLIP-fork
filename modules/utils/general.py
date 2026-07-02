@@ -1,4 +1,5 @@
 import torch, pickle, gc, random
+from datetime import datetime
 import numpy as np
 
 def get_device():
@@ -44,3 +45,23 @@ def flatten(container):
                 yield j
         else:
             yield i
+
+def log_phase(name: str):
+    print(f"\n[{name.upper()}] " + "—" * (60 - len(name)))
+
+def serialise_subsapce(sub_config):
+    identity_keys = ['layers', 'hidden_dim', 'n', 'p', 's', 'bond_dim', 'max_order']
+    parts = []
+    for key in identity_keys:
+        if key in sub_config:
+            val = sub_config[key]
+            if type(val) is int and not isinstance(val, bool):
+                label = key[:3] if len(key) > 3 else key
+                parts.append(f"{label}{val}")
+    return "_".join(parts)
+
+def gen_id(config):
+    t_str = f"t_{serialise_subsapce(config['text'])}"
+    v_str = f"v_{serialise_subsapce(config['vision'])}"
+    timestamp = datetime.now().strftime('%m%d_%H%M')
+    return f"{t_str}__{v_str}__{timestamp}"

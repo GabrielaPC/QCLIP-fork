@@ -217,7 +217,7 @@ def main():
 
             qc_pos.add_register(qreg_img, qreg_anc_pos, creg_anc_pos)
             qc_pos.compose(qc_pos_img, qreg_img, inplace=True)
-            
+
             qc_pos.h(qreg_anc_pos)
             for m_idx in range(len(output_qubits)):
                 qc_pos.cswap(qreg_anc_pos, qreg_txt[output_qubits[m_idx]], qreg_img[m_idx])
@@ -246,5 +246,27 @@ def main():
 
         except Exception as e:
             failed_circuits += 1
-            tqdm.write(f" ⚠️ Circuit compilation dropped at sample index {idx}: {e}")
+            tqdm.write(f" Circuit compilation dropped at sample index {idx}: {e}")
+
+    if not pos_circs:
+        print(" Terminal Execution Halt: No valid quantum circuits were assembled.")
+        sys.exit(1)
     
+    log_phase("Executing Emulator Engine Pipeline")
+    print(f" Simulating quantum states across {len(pos_circs)} pairs...")
+
+    start_eval_time = time.time()
+    with torch.no_grad():
+        pos_f = run_circuits(pos_circs, sampler, shots)
+        neg_f = run_circuits(neg_circs, sampler, shots)
+        cum_acc = circ_acc(pos_f, neg_f)
+    elapsed = time.time() - start_eval_time
+    print(f"    Completed in {elapsed:.2f}s")
+
+    log_phase("Benchmark Emulation Results")
+    print(f" {'Metric Key':<35} | {'Value / Score':<15}")
+    print(" " + "—" * 53)
+    print(f"  {'Evaluated Dataset Pairs':<34} | {len(pos_circs):.6f}")
+    print(f"  {'Target Resolution (Shots)':<34} | {shots:.6f}")
+    print(f"  {'Pipeline Cumulative Accuracy':<34} | \033[92m{cum_acc:.6f}\033[0m")
+    print(" " + "—" * 53 + "\n")

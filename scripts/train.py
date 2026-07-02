@@ -5,25 +5,10 @@ from pathlib import Path
 from datetime import datetime
 
 from factory import build_experiment, build_dataset
-from modules.utils.general import load_pkl, get_device, set_seed
+from modules.utils.general import load_pkl, get_device, set_seed, gen_id, log_phase
 from modules.models.fusion.engine import ContrastiveTrainer, MMEvaluator
 
 from tqdm import tqdm
-
-def log_phase(name: str):
-    print(f"\n[{name.upper()}] " + "—" * (60 - len(name)))
-
-def gen_id(config):
-    new_id = 't'
-    for key in config['text']:
-        if type(config['text'][key]) is int:
-            new_id += f"_{config['text'][key]}"
-    new_id += '_v'
-    for key in config['vision']:
-        if type(config['vision'][key]) is int:
-            new_id += f"_{config['vision'][key]}"
-    new_id += f'_{datetime.now().strftime("%m%d_%H%M")}'
-    return new_id
 
 # uv run python train.py --config configs/tensor_network.yaml
 if __name__ == "__main__":
@@ -119,9 +104,13 @@ if __name__ == "__main__":
     txt_tower = type(text_model).__name__
     img_tower = type(image_model).__name__
     run_name = gen_id(config)
+
     checkpoint_dir = Path(f"./checkpoints/{DATASET}/{txt_tower}_{img_tower}")
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
     checkpoint_path = checkpoint_dir / f"{run_name}.pt"
+    with open(checkpoint_dir / f"{run_name}_config.yaml", 'w') as f:
+        yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
     mlf_db_path = ROOT_PATH / f"mlf_dbs/{DATASET}.db"
     mlf_db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -147,6 +136,7 @@ if __name__ == "__main__":
             "image_tower": img_tower,
             "execution_host": hostname,
             "platform_node": system_node,
+            "model_path": str(checkpoint_path),
             })
         
         epoch_pbar = tqdm(range(config['epochs']), desc="Training Pipeline", unit="epoch")
@@ -164,7 +154,12 @@ if __name__ == "__main__":
                     print(f"Warning: Evaluation method '{task_name}' not found on MMEvaluator. Skipping.")
                     continue
 
-                task_metrics = eval_fn(val_loader, eval_mapper) if task_name == "global_retrieval" else eval_fn(val_loader)
+                if task_name == "global_retrieval":
+                    task_metrics = eval_fn(val_loader, eval_mapper)
+                elif task_name == "compositional_diagnostic":
+                    task_metrics = eval_fn(val_loader, labels=config['dataset']['labels'])
+                else:
+                    task_metrics = eval_fn(val_loader)
                 metrics.update(task_metrics)
             
             mlflow.log_metrics(metrics, step=epoch)

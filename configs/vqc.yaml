@@ -20,6 +20,7 @@ vision:
 
 dataset:
   name: "aro"
+  labels: ["image", "pos_caption", "neg_caption"]
   class: "modules.data_pipeline.datasets.ARODataset"
   collate_fn: "modules.data_pipeline.datasets.aro_collate_fn"
   eval_mapper: "modules.models.fusion.engine.aro_mapper"
@@ -37,6 +38,7 @@ splits:
 
 # dataset:
 #   name: "svo-probes"
+#   labels: ["caption", "pos_image", "neg_image"]
 #   class: "modules.data_pipeline.datasets.SVODataset"
 #   collate_fn: "modules.data_pipeline.datasets.svo_collate_fn"
 #   eval_mapper: "modules.models.fusion.engine.svo_mapper"

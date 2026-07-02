@@ -234,11 +234,11 @@ class MMEvaluator:
         return {"swap_acc": correct / total}
     
     @torch.no_grad()
-    def compositional_diagnostic(self, dataloader):
-        """
-        Calculates the explicit similarity distributions between true and foil pairs
-        to detect representation collapse and semantic smearing.
-        """
+    def compositional_diagnostic(self, dataloader, labels=None):
+        if not labels:
+            labels = ['m1', 'm2_pos', 'm2_neg']
+            raise ValueError("label_map must be provided for this method." \
+            "Requires: 'm1' for first fixed modality, 'm2_pos' for positive second modality, and 'm2_neg' for negative second modality.")
         self.image_model.eval()
         self.text_model.eval()
 
@@ -251,13 +251,13 @@ class MMEvaluator:
             # txt_emb = self._encode_txt(batch["caption"])
             # pos_img_emb = self._encode_img(batch["pos_image"])
             # neg_img_emb = self._encode_img(batch["neg_image"])
-            txt_emb = self._encode_txt(batch["image"])
-            pos_img_emb = self._encode_img(batch["pos_caption"])
-            neg_img_emb = self._encode_img(batch["neg_caption"])
+            m1_emb = self._encode_txt(batch[labels[0]])
+            pos_m2_emb = self._encode_img(batch[labels[1]])
+            neg_m2_emb = self._encode_img(batch[labels[2]])
             
             # Replicating your model's native similarity metric calculation
-            pos_sim = torch.sum(txt_emb * pos_img_emb, dim=1).abs()
-            neg_sim = torch.sum(txt_emb * neg_img_emb, dim=1).abs()
+            pos_sim = torch.sum(m1_emb * pos_m2_emb, dim=1).abs()
+            neg_sim = torch.sum(m1_emb * neg_m2_emb, dim=1).abs()
             
             # Compute the absolute distance between the positive and negative scores per sample
             batch_gap = (pos_sim - neg_sim).abs()
@@ -265,7 +265,7 @@ class MMEvaluator:
             sum_pos_sim += pos_sim.sum().item()
             sum_neg_sim += neg_sim.sum().item()
             sum_absolute_gap += batch_gap.sum().item()
-            total_samples += txt_emb.size(0)
+            total_samples += m1_emb.size(0)
 
         if total_samples == 0:
             return {}
