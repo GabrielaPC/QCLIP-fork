@@ -4,8 +4,10 @@ learning_rate: 0.001
 epochs: 50
 embedding_dim: 512
 
-compiler:
+text:
   use_tree: false
+  universal: false
+  hidden_dim: 64
 
 vision:
   use_clip: false

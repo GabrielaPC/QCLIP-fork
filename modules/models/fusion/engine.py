@@ -3,7 +3,7 @@ from typing import Callable
 import torch.nn.functional as F
 
 mscoco_mapper = lambda batch: (batch["image"], batch["caption"])
-aro_mapper = lambda batch: (batch["image_id"], batch["true_caption"])
+aro_mapper = lambda batch: (batch["image"], batch["pos_caption"])
 svo_mapper = lambda batch: (batch["pos_image"], batch["caption"])
 
 class ContrastiveTrainer:
@@ -148,8 +148,8 @@ class MMEvaluator:
         correct = total = 0
         for batch in dataloader:
             img_emb = self._encode_img(batch["image"])
-            pos_txt_emb = self._encode_txt(batch["true_caption"])
-            neg_txt_emb = self._encode_txt(batch["false_caption"])
+            pos_txt_emb = self._encode_txt(batch["pos_caption"])
+            neg_txt_emb = self._encode_txt(batch["neg_caption"])
             
             pos_sim = torch.sum(img_emb * pos_txt_emb, dim=1)
             neg_sim = torch.sum(img_emb * neg_txt_emb, dim=1)
@@ -179,9 +179,9 @@ class MMEvaluator:
         correct = total = 0
         for batch in dataloader:
             img_emb = self._encode_img(batch["image"])
-            pos1_emb = self._encode_txt(batch["caption_pos_1"])
-            pos2_emb = self._encode_txt(batch["caption_pos_2"])
-            neg_emb = self._encode_txt(batch["caption_neg"])
+            pos1_emb = self._encode_txt(batch["pos_caption1"])
+            pos2_emb = self._encode_txt(batch["pos_caption2"])
+            neg_emb = self._encode_txt(batch["neg_caption"])
             
             sim_pos1 = torch.sum(img_emb * pos1_emb, dim=1)
             sim_pos2 = torch.sum(img_emb * pos2_emb, dim=1)
@@ -215,3 +215,63 @@ class MMEvaluator:
             total += i0.size(0)
         
         return {"txt_score": text_corr/total, "img_score": img_corr/total, "grp_score": group_corr/total}
+    
+    @torch.no_grad()
+    def evaluate_swap(self, dataloader) -> float:
+        self.image_model.eval()
+        self.text_model.eval()
+        correct = total = 0
+        for batch in dataloader:
+            img_emb = self._encode_img(batch["image"])
+            pos_txt_emb = self._encode_txt(batch["pos_caption"])
+            neg_txt_emb = self._encode_txt(batch["neg_caption"])
+            
+            pos_sim = torch.sum(img_emb * pos_txt_emb, dim=1).abs()
+            neg_sim = torch.sum(img_emb * neg_txt_emb, dim=1).abs()
+            
+            correct += (pos_sim > neg_sim).sum().item()
+            total += img_emb.size(0)
+        return {"swap_acc": correct / total}
+    
+    @torch.no_grad()
+    def compositional_diagnostic(self, dataloader):
+        """
+        Calculates the explicit similarity distributions between true and foil pairs
+        to detect representation collapse and semantic smearing.
+        """
+        self.image_model.eval()
+        self.text_model.eval()
+
+        sum_pos_sim = 0.0
+        sum_neg_sim = 0.0
+        sum_absolute_gap = 0.0
+        total_samples = 0
+
+        for batch in dataloader:
+            # txt_emb = self._encode_txt(batch["caption"])
+            # pos_img_emb = self._encode_img(batch["pos_image"])
+            # neg_img_emb = self._encode_img(batch["neg_image"])
+            txt_emb = self._encode_txt(batch["image"])
+            pos_img_emb = self._encode_img(batch["pos_caption"])
+            neg_img_emb = self._encode_img(batch["neg_caption"])
+            
+            # Replicating your model's native similarity metric calculation
+            pos_sim = torch.sum(txt_emb * pos_img_emb, dim=1).abs()
+            neg_sim = torch.sum(txt_emb * neg_img_emb, dim=1).abs()
+            
+            # Compute the absolute distance between the positive and negative scores per sample
+            batch_gap = (pos_sim - neg_sim).abs()
+
+            sum_pos_sim += pos_sim.sum().item()
+            sum_neg_sim += neg_sim.sum().item()
+            sum_absolute_gap += batch_gap.sum().item()
+            total_samples += txt_emb.size(0)
+
+        if total_samples == 0:
+            return {}
+
+        return {
+            "diag_mean_pos_overlap": sum_pos_sim / total_samples,
+            "diag_mean_neg_overlap": sum_neg_sim / total_samples,
+            "diag_collapse_gap": sum_absolute_gap / total_samples
+        }

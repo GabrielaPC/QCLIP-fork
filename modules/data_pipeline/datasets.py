@@ -96,7 +96,7 @@ class ARODataset(BaseDataset):
         row_compiled = self.compiled_df.iloc[idx]
         
         # Load image
-        image = self._load_image(row_compiled['image'])
+        image = self._load_image(row_compiled['image_id'])
         
         # Extract both expressions side-by-side for comparison scoring
         pos_einsum = row_compiled['true_caption_einsum']
@@ -106,19 +106,19 @@ class ARODataset(BaseDataset):
         neg_symbols = row_compiled['false_caption_symbols']
         
         return {"image": image,
-                "caption_pos": (pos_einsum, pos_symbols),
-                "caption_neg": (neg_einsum, neg_symbols)
+                "pos_caption": (pos_einsum, pos_symbols),
+                "neg_caption": (neg_einsum, neg_symbols)
                 }
     
 def aro_collate_fn(batch):
     images = torch.stack([item['image'] for item in batch])
-    pos_captions = [item['caption_pos'] for item in batch] 
-    neg_captions = [item['caption_neg'] for item in batch]
+    pos_captions = [item['pos_caption'] for item in batch] 
+    neg_captions = [item['neg_caption'] for item in batch]
     
     return {
         "image": images,
-        "caption_pos": pos_captions,
-        "caption_neg": neg_captions
+        "pos_caption": pos_captions,
+        "neg_caption": neg_captions
     }
     
 class SVODataset(BaseDataset):
@@ -194,22 +194,22 @@ class SugarCrepePPDataset(BaseDataset):
         neg = (row_compiled['negative_caption_einsum'], row_compiled['negative_caption_symbols'])
         
         return {"image": image,
-                "caption_pos1": pos1,
-                "caption_pos2": pos2,
-                "caption_neg": neg
+                "pos_caption1": pos1,
+                "pos_caption2": pos2,
+                "neg_caption": neg
                 }
 
 def sugarcrepe_collate_fn(batch):
     images = torch.stack([item['image'] for item in batch])
-    pos1_captions = [item['caption_pos1'] for item in batch] 
-    pos2_captions = [item['caption_pos2'] for item in batch]
-    neg_captions = [item['caption_neg'] for item in batch]
+    pos1_captions = [item['pos_caption1'] for item in batch] 
+    pos2_captions = [item['pos_caption2'] for item in batch]
+    neg_captions = [item['neg_caption'] for item in batch]
     
     return {
         "image": images,
-        "caption_pos1": pos1_captions,
-        "caption_pos2": pos2_captions,
-        "caption_neg": neg_captions
+        "pos_caption1": pos1_captions,
+        "pos_caption2": pos2_captions,
+        "neg_caption": neg_captions
     }
 
 class WinoGroundDataset(BaseDataset):

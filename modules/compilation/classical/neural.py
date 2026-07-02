@@ -34,7 +34,7 @@ class MLPCompiler:
             word, idx_arr, type_arr = tn[w_idx]
             symbol_name = f"{word}_{'@'.join(type_arr)}"
             plan.append({
-                'sym': symbol_name,
+                'name': symbol_name,
                 'idx': idx_arr,
                 'out': word_outputs[w_idx]
             })
@@ -72,19 +72,19 @@ class MLPCompiler:
             word, idx_arr, type_arr = tn[w_idx]
             if len(idx_arr) == 1:
                 plan.append({
-                    'sym': word,
+                    'name': word,
                     'idx': idx_arr,
                     'out': word_outputs[w_idx]
                 })
             else:
                 new_idx = chr(next(counter))
                 plan.append({
-                    'sym': word,
+                    'name': word,
                     'idx': [new_idx],
                     'out': [new_idx]
                 })
                 plan.append({
-                    'sym': '@'.join(type_arr),
+                    'name': '@'.join(type_arr),
                     'idx': idx_arr + [new_idx],
                     'out': word_outputs[w_idx]
                 })
@@ -98,7 +98,6 @@ class MLPCompiler:
             base_label = col.replace('_diagram', '')
             first_val = tn_df[col].iloc[0]
             
-            # Detect MSCOCO nested caption array structures
             is_nested = isinstance(first_val, list) and len(first_val) > 0 and isinstance(first_val[0], list)
 
             plans_arr = []
@@ -107,12 +106,12 @@ class MLPCompiler:
                 if is_nested:
                     results = [self.compile_tn(t) for t in row]
                     plans_arr.append(results)
-                    row_symbols = [[step['sym'] for step in plan] for plan in results]
+                    row_symbols = [[step['name'] for step in plan] for plan in results]
                     symbols_arr.append(row_symbols)
                 else:
                     plan = self.compile_tn(row)
                     plans_arr.append(plan)
-                    row_symbols = [step['sym'] for step in plan]
+                    row_symbols = [step['name'] for step in plan]
                     symbols_arr.append(row_symbols)
                     
             tn_df[f"{base_label}_einsum"] = plans_arr

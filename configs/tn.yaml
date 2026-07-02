@@ -4,7 +4,7 @@ learning_rate: 0.001
 epochs: 25
 embedding_dim: 512
 
-compiler:
+text:
   n: 128
   s: 128
   p: 128

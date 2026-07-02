@@ -5,40 +5,40 @@ import numpy as np
 from sklearn.decomposition import PCA, IncrementalPCA
 from opt_einsum import contract_expression
 from modules.compilation.quantum.gates import *
-from modules.utils.quantum_ops import amplitude_encoding
-
-
-class FrozenCLIP(nn.Module):
-    def __init__(self, clip_model = None, classical=True):
-        super().__init__()
-        self.clip_model = clip_model
-        self.params = nn.ParameterList([])
-        self.classical = classical
-
-    def forward(self, img_vecs):
-        if self.classical:
-            return img_vecs
-        else:
-            return amplitude_encoding(img_vecs)
 
 class QuantumFeatureMap(nn.Module):
-    def __init__(self, k: int, layers: int, batch_size: int, id_init=False):
+    def __init__(self, k: int, layers: int, batch_size: int, id_init=False, neural=False):
         super().__init__()
         self.k = k
+        self.out_dim = 2 ** k
         self.layers = layers
         self.batch_size = batch_size
         self.params = nn.ParameterList([])
         self.sym2param = {}
-        self.pca = IncrementalPCA(n_components=k)
+        self.neural = neural
 
-        self.init_params(id_init)
+        if self.neural:
+            self.projector = nn.Sequential(
+                nn.Linear(self.out_dim, self.out_dim // 2),
+                nn.LayerNorm(self.out_dim // 2),
+                nn.SiLU(),
+                nn.Linear(self.out_dim // 2, 3 * k * layers),
+            )
+            nn.init.uniform_(self.projector[3].weight, a=-1e-4, b=1e-4)
+            nn.init.zeros_(self.projector[3].bias)
+        else:
+            self.pca = IncrementalPCA(n_components= 3 * k * layers)
+
         self.compile_fmap()
+        self.init_params(id_init)
+        self.global_pca_max = 1.0  # Placeholder for normalization during PCA projection
 
     def init_params(self, id_init=False):
         if id_init:
-            self.params = nn.Parameter(torch.empty(self.layers * (2*self.k - 1)).uniform_(-0.01, 0.01), requires_grad=True)
+            raw_tensor = torch.empty(len(self.sym2param),).uniform_(-0.01, 0.01)
         else:
-            self.params = nn.Parameter(torch.randn(self.layers * (2*self.k - 1)) * 2 * torch.pi)
+            raw_tensor = torch.randn(len(self.sym2param),) * 2 * torch.pi
+        self.params = nn.Parameter(raw_tensor, requires_grad=True)
 
     def reset_char(self):
         self.char_idx = count(0)
@@ -62,18 +62,20 @@ class QuantumFeatureMap(nn.Module):
         symbol_idx = 0
         for l in range(self.layers):
             op_idx = 0
+
             for i in range(self.k):
-                nxt = self.get_char()
-                input_indices.append('b' + current_wires[i] + nxt)
-                symbol = f"pca_{i}"
-                tensor_arr.append((symbol, 'Rx'))
-                shape_arr.append([self.batch_size, 2, 2])
-                current_wires[i] = nxt
+                for rotation in ['Rx', 'Ry', 'Rz']:
+                    nxt = self.get_char()
+                    input_indices.append('b' + current_wires[i] + nxt)
+                    symbol = f"ftr_{rotation}_l{l}_{i}"
+                    tensor_arr.append((symbol, rotation))
+                    shape_arr.append([self.batch_size, 2, 2])
+                    current_wires[i] = nxt
 
             for i in range(self.k):
                 nxt = self.get_char()
                 input_indices.append(current_wires[i] + nxt)
-                symbol = f"img_l{l}_{op_idx}"
+                symbol = f"img_Ry_l{l}_{op_idx}"
                 tensor_arr.append((symbol, 'Ry'))
                 self.sym2param[symbol] = symbol_idx
                 symbol_idx += 1
@@ -82,11 +84,11 @@ class QuantumFeatureMap(nn.Module):
                 op_idx += 1
 
             if self.k > 1:
-                for i in range(self.k-1):
+                for i in range(self.k):
                     c_idx, t_idx = i, (i + 1) % self.k
                     c_out, t_out = self.get_char(), self.get_char()
                     input_indices.append(current_wires[c_idx] + current_wires[t_idx] + c_out + t_out)
-                    symbol = f"img_l{l}_{op_idx}"
+                    symbol = f"img_CRz_l{l}_{op_idx}"
                     tensor_arr.append((symbol, 'CRz'))
                     self.sym2param[symbol] = symbol_idx
                     symbol_idx += 1
@@ -96,6 +98,7 @@ class QuantumFeatureMap(nn.Module):
         
         einsum_str = f"{','.join(input_indices)}->b{''.join(current_wires)}"
         self.gate_arr = tensor_arr
+        self.einsum_expr = einsum_str
         self.contraction_path = contract_expression(einsum_str, *shape_arr)
 
     def fit_image_pca(self, image_stream, batch_size=2048):
@@ -107,27 +110,70 @@ class QuantumFeatureMap(nn.Module):
                 batch = []
         if batch:
             self.pca.partial_fit(np.array(batch))
+        # Update the global PCA maximum after fitting
+        self.global_pca_max = np.max(np.abs(self.pca.transform(np.array(batch))))
+
+    def get_features(self, img_vecs):
+        if self.neural:
+            if not torch.is_tensor(img_vecs):
+                img_vecs = torch.tensor(img_vecs, dtype=torch.float32, device=self.params.device)
+            features = self.projector(img_vecs.view(img_vecs.shape[0], -1)) * torch.pi
+        else:
+            if torch.is_tensor(img_vecs):
+                flat_vector = img_vecs.detach().cpu().numpy().reshape(len(img_vecs), -1)
+            else:
+                flat_vector = np.asarray(img_vecs).reshape(len(img_vecs), -1)
+            raw_pca = self.pca.transform(flat_vector)
+            norm_pca = (raw_pca / (self.global_pca_max + 1e-8)) * np.pi
+            features = torch.tensor(norm_pca, dtype=torch.float32, device=self.params.device)
+        return features 
+    
+    def encode_features(self, img_vec):
+        features = self.get_features(img_vec)
+        axis_map = {'Rx': 0, 'Ry': 1, 'Rz': 2}
+        sym2ftr = {}
+        for symbol, gate in self.gate_arr:
+            parts = symbol.split('_')
+            param_type = parts[0]
+            if param_type == 'ftr':
+                layer_idx = int(parts[2][1:])
+                qubit_idx = int(parts[3])
+                axis_offset = axis_map[gate]
+                flat_idx = (layer_idx * self.k * 3) + (qubit_idx * 3) + axis_offset 
+
+                feature_tensor = features[flat_idx]
+                sym2ftr[symbol] = feature_tensor
+        return sym2ftr
 
     def forward(self, img_vecs):
-        if torch.is_tensor(img_vecs):
-            flat_vector = img_vecs.detach().cpu().numpy().reshape(len(img_vecs), -1)
-        else:
-            flat_vector = np.asarray(img_vecs).reshape(len(img_vecs), -1)
-
-        features = self.pca.transform(flat_vector)
-        dev = self.params.device
-        dtype = self.params.dtype
+        features = self.get_features(img_vecs)
+        
         tensor_arr = []
+        axis_map = {'Rx': 0, 'Ry': 1, 'Rz': 2}
         for symbol, gate in self.gate_arr:
             if gate == '0':
-                tensor_arr.append(torch.tensor([1, 0], dtype=torch.complex64, device=dev))
-            elif gate == 'Rx':
-                idx = int(symbol.split('_')[1])
-                tensor_arr.append(Rx(torch.tensor(features[:, idx], dtype=dtype, device=dev)))
-            elif gate == 'Ry':
-                idx = self.sym2param[symbol]
-                tensor_arr.append(Ry(self.params[idx]))
-            elif gate == 'CRz':
-                idx = self.sym2param[symbol]
-                tensor_arr.append(CRz(self.params[idx]))
-        return self.contraction_path(*tensor_arr)
+                tensor_arr.append(torch.tensor([1, 0], dtype=torch.complex64, device=self.params.device))
+                continue
+
+            parts = symbol.split('_')
+            param_type = parts[0]
+
+            if param_type == 'ftr':
+                layer_idx = int(parts[2][1:])
+                qubit_idx = int(parts[3])
+                axis_offset = axis_map[gate]
+                flat_idx = (layer_idx * self.k * 3) + (qubit_idx * 3) + axis_offset 
+
+                feature_tensor = features[:, flat_idx]
+                if gate == 'Rx': tensor_arr.append(Rx(feature_tensor))
+                if gate == 'Ry': tensor_arr.append(Ry(feature_tensor))
+                if gate == 'Rz': tensor_arr.append(Rz(feature_tensor))
+            elif param_type == 'img':
+                if gate == 'Ry':
+                    idx = self.sym2param[symbol]
+                    tensor_arr.append(Ry(self.params[idx]))
+                if gate == 'CRz':
+                    idx = self.sym2param[symbol]
+                    tensor_arr.append(CRz(self.params[idx]))
+
+        return self.contraction_path(*tensor_arr)   

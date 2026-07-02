@@ -7,6 +7,8 @@ from tqdm import tqdm
 from opt_einsum import contract_path
 import cotengra as ctg
 
+from modules.utils.tensor_ops import einsum2interleaved, interleaved2einsum
+
 def tn_metadata(data_arr):
     max_nq = max_gates = max_width = max_cdepth = 0
     avg_nq = avg_gates = avg_width = avg_cdepth = 0
@@ -30,21 +32,21 @@ def tn_metadata(data_arr):
             'avg': (int(round(avg_nq)), int(round(avg_gates)), int(round(avg_cdepth)), int(round(avg_width)))}
 
 def analyse_einsum(einsum_expr, tarr, cache={}):
-    op_types = tuple(op[1] for op in tarr)
-    input_subs, output_sub = einsum_expr
-    einsum_str = ','.join([''.join(ten) for ten in input_subs]) + '->' + ','.join([''.join(ten) for ten in output_sub])
-    cache_key = (einsum_str, op_types)
+    op_types = tuple(op['op_type'] for op in tarr)
+    cache_key = (einsum_expr, op_types)
     if cache_key in cache:
             return cache[cache_key]
 
     qubit_depths = defaultdict(int)
     shapes = []
     nq = 0
+
+    input_subs, output_sub = einsum2interleaved(einsum_expr)
             
-    for i, (subscript, (symbol, op_type)) in enumerate(zip(input_subs, tarr)):
+    for subscript, gate in zip(input_subs, tarr):
+        symbol, op_type = gate['name'], gate['op_type']
         if symbol is None:
-            if op_type == 'sqrt': data_shape = torch.Size([])
-            elif op_type == '0':
+            if op_type == '0':
                 data_shape = torch.Size([2])
                 nq += 1
             elif op_type == '0_dag':

@@ -1,7 +1,8 @@
-import torch, mlflow, time, yaml, argparse, os, logging
+import torch, mlflow, time, yaml, argparse, os, logging, socket, platform
 from torch.utils.data import DataLoader
 from torchvision.transforms import v2
 from pathlib import Path
+from datetime import datetime
 
 from factory import build_experiment, build_dataset
 from modules.utils.general import load_pkl, get_device, set_seed
@@ -11,6 +12,18 @@ from tqdm import tqdm
 
 def log_phase(name: str):
     print(f"\n[{name.upper()}] " + "—" * (60 - len(name)))
+
+def gen_id(config):
+    new_id = 't'
+    for key in config['text']:
+        if type(config['text'][key]) is int:
+            new_id += f"_{config['text'][key]}"
+    new_id += '_v'
+    for key in config['vision']:
+        if type(config['vision'][key]) is int:
+            new_id += f"_{config['vision'][key]}"
+    new_id += f'_{datetime.now().strftime("%m%d_%H%M")}'
+    return new_id
 
 # uv run python train.py --config configs/tensor_network.yaml
 if __name__ == "__main__":
@@ -75,10 +88,11 @@ if __name__ == "__main__":
         text_model.from_plans(list(plan_stream))
         print(f" Text Model Parameters mapped: {len(text_model.leaves)} Leaves | {len(text_model.mlps)} MLPs.")
 
-    if hasattr(image_model, "fit_image_pca"):
+    if hasattr(image_model, "fit_image_pca") and config['vision']['neural'] == False:
         train_embeddings = torch.load(config['splits']['train']['img_path'])
         image_model.fit_image_pca(torch.stack(list(train_embeddings.values())).to(DEV))
         print(" Visual projection layers calibrated via target PCA.")
+    print(f" Model Parameter Counts: Image={sum(p.numel() for p in image_model.parameters())} | Text={sum(p.numel() for p in text_model.parameters())}")
 
     # Prepare data loaders and optimisers
     log_phase("Preparing Pipeline Execution")
@@ -102,8 +116,10 @@ if __name__ == "__main__":
     print(" Gradient step managers and performance metrics trackers bound.")
 
     # Serialisation and logging setup
-    run_name = f"{int(time.time())}"
-    checkpoint_dir = Path(f"./checkpoints/{DATASET}")
+    txt_tower = type(text_model).__name__
+    img_tower = type(image_model).__name__
+    run_name = gen_id(config)
+    checkpoint_dir = Path(f"./checkpoints/{DATASET}/{txt_tower}_{img_tower}")
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = checkpoint_dir / f"{run_name}.pt"
 
@@ -114,8 +130,11 @@ if __name__ == "__main__":
     mlflow.set_tracking_uri(f"sqlite:///{mlf_db_path}")
     mlflow.set_experiment(DATASET)
 
+    hostname = socket.gethostname()
+    system_node = platform.node()
+
     # Training and evaluation loop
-    log_phase("Model optimisation and evaluation...")
+    log_phase(f"Model #{run_name}: optimisation and evaluation started on \"{hostname}\"...")
     with mlflow.start_run(run_name=run_name):
         mlflow.log_params({
             "epochs": config['epochs'],
@@ -124,8 +143,10 @@ if __name__ == "__main__":
             "temperature_parameter": loss_fn.temperature,
             "device_target": str(DEV),
             "seed": SEED,
-            "image_tower": type(image_model).__name__,
-            "text_tower": type(text_model).__name__,
+            "text_tower": txt_tower,
+            "image_tower": img_tower,
+            "execution_host": hostname,
+            "platform_node": system_node,
             })
         
         epoch_pbar = tqdm(range(config['epochs']), desc="Training Pipeline", unit="epoch")

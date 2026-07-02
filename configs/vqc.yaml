@@ -3,8 +3,9 @@ batch_size: 256
 learning_rate: 0.001
 epochs: 100
 embedding_qubits: 9
+emulation_set: "swap"
 
-compiler:
+text:
   ansatz: "custom_v5"
   n: 3
   s: 3
@@ -13,22 +14,47 @@ compiler:
   curry: true
 
 vision:
-  layers: 3
+  layers: 5
+  neural: true
   use_clip: false
 
 dataset:
-  name: "svo-probes"
-  class: "modules.data_pipeline.datasets.SVODataset"
-  collate_fn: "modules.data_pipeline.datasets.svo_collate_fn"
-  eval_mapper: "modules.models.fusion.engine.svo_mapper"
+  name: "aro"
+  class: "modules.data_pipeline.datasets.ARODataset"
+  collate_fn: "modules.data_pipeline.datasets.aro_collate_fn"
+  eval_mapper: "modules.models.fusion.engine.aro_mapper"
 
 splits:
   train:
-    text_path: "data/svo-probes/processed/train.pkl"
-    img_path: "data/svo-probes/processed/image_embeddings.pt"
+    text_path: "data/aro/processed/train.pkl"
+    img_path: "data/aro/processed/image_embeddings.pt"
   val:
-    text_path: "data/svo-probes/processed/val.pkl"
-    img_path: "data/svo-probes/processed/image_embeddings.pt"
+    text_path: "data/aro/processed/val.pkl"
+    img_path: "data/aro/processed/image_embeddings.pt"
+  test:
+    text_path: "data/aro/processed/test.pkl"
+    img_path: "data/aro/processed/image_embeddings.pt"
+
+# dataset:
+#   name: "svo-probes"
+#   class: "modules.data_pipeline.datasets.SVODataset"
+#   collate_fn: "modules.data_pipeline.datasets.svo_collate_fn"
+#   eval_mapper: "modules.models.fusion.engine.svo_mapper"
+
+# splits:
+#   train:
+#     text_path: "data/svo-probes/processed/train.pkl"
+#     img_path: "data/svo-probes/processed/image_embeddings.pt"
+#   val:
+#     text_path: "data/svo-probes/processed/val.pkl"
+#     img_path: "data/svo-probes/processed/image_embeddings.pt"
+#   test:
+#     text_path: "data/svo-probes/processed/test.pkl"
+#     img_path: "data/svo-probes/processed/image_embeddings.pt"
+#   swap:
+#     text_path: "data/svo-probes/processed/swap.pkl"
+#     img_path: "data/svo-probes/processed/image_embeddings.pt"
 
 evaluation_tasks:
   - "evaluate_image_choice"
+  - compositional_diagnostic

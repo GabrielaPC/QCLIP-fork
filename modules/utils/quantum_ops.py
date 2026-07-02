@@ -1,8 +1,9 @@
 import torch, math
-from qiskit import QuantumCircuit
+from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister
 from qiskit.circuit import Parameter
 from collections import defaultdict
 import numpy as np
+from random import randint
 import torch.nn.functional as F
 
 def fs_distance(state1, state2):
@@ -35,14 +36,16 @@ def amplitude_encoding(vector):
     
     return state_vector
 
-def tn2qiskit(einsum_expr, gate_arr):
+def tn2qiskit(einsum_expr, gate_arr, param_dict={}, meas_output=True):
     input_indices, _ = einsum_expr
     nq = sum(1 for gate in gate_arr if gate['op_type'] == '0')
-    qc = QuantumCircuit(nq, nq)
+    qreg = QuantumRegister(nq, f"qc{randint(1,10000)}")
+    creg = ClassicalRegister(nq, f"c{randint(1,10000)}")
+    qc = QuantumCircuit(qreg, creg)
     wire2q = defaultdict(list)
     qcounter = 0
-    param_dict = {}
     name2param = {}
+    qiskit_param_dict = {}
 
     for idx_arr, gate in zip(input_indices, gate_arr):
         if gate['op_type'] == '0':
@@ -67,7 +70,10 @@ def tn2qiskit(einsum_expr, gate_arr):
                     param = Parameter(gate['name'])
                     name2param[gate['name']] = param
                 gate_func(param, *q_targets)
-                param_dict[param] = np.random.rand() * 2 * np.pi
+                if gate['name'] not in param_dict:
+                    qiskit_param_dict[param] = np.random.rand() * 2 * np.pi
+                else:
+                    qiskit_param_dict[param] = param_dict[gate['name']]
 
             for w, q in zip(out_wires, q_targets):
                 wire2q[w].append(q) 
@@ -82,7 +88,8 @@ def tn2qiskit(einsum_expr, gate_arr):
             qc.measure(q_right, q_right)
         elif len(q_list) == 1:
             q_out = q_list[0]
-            qc.measure(q_out, q_out)
+            if meas_output:
+                qc.measure(q_out, q_out)
             output_qubits.append(q_out)
     
     return qc, output_qubits, param_dict

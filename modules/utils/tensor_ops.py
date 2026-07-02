@@ -6,11 +6,10 @@ def einsum2interleaved(expr):
             raise ValueError("Invalid einsum string format. Missing '->' operator.")
             
         lhs, rhs = expr.split('->')
-        input_tensors = [tok.strip() for tok in lhs.split(',') if tok.strip()]
-        input_indices = [list(tensor) for tensor in input_tensors]
+        input_indices = [list(tok.strip()) for tok in lhs.split(',') if tok.strip()]
         out_list = list(rhs.strip())
         
-        return (input_indices, out_list)
+        return [input_indices, out_list]
     
 def interleaved2einsum(input_indices, out_list):
     lhs = ",".join("".join(tensor) for tensor in input_indices)
