@@ -48,7 +48,7 @@ if __name__ == "__main__":
 
     compile_kwargs = {}
     if config['model_type'] == 'vqc':
-        compile_kwargs["curry"] = config["compiler"].get("curry", False)
+        compile_kwargs["curry"] = config["text"].get("curry", False)
     compiled_train = ansatz.compile_dataset(df_train, **compile_kwargs)
     compiled_val = ansatz.compile_dataset(df_val, **compile_kwargs)
     print(f" Dataset footprints compiled: Train={len(compiled_train)} | Val={len(compiled_val)}")

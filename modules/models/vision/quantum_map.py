@@ -51,12 +51,12 @@ class QuantumFeatureMap(nn.Module):
     def compile_fmap(self):
         self.reset_char()
         input_indices = []
-        tensor_arr = []
+        gate_arr = []
         shape_arr = []
 
         current_wires = [self.get_char() for _ in range(self.k)]
         input_indices.extend([w for w in current_wires])
-        tensor_arr.extend([(None, '0')] * self.k)
+        gate_arr.extend({'name': None, 'op_type': '0'} for _ in range(self.k))
         shape_arr.extend([[2]] * self.k)
 
         symbol_idx = 0
@@ -68,7 +68,7 @@ class QuantumFeatureMap(nn.Module):
                     nxt = self.get_char()
                     input_indices.append('b' + current_wires[i] + nxt)
                     symbol = f"ftr_{rotation}_l{l}_{i}"
-                    tensor_arr.append((symbol, rotation))
+                    gate_arr.append({'name': symbol, 'op_type': rotation})
                     shape_arr.append([self.batch_size, 2, 2])
                     current_wires[i] = nxt
 
@@ -76,7 +76,7 @@ class QuantumFeatureMap(nn.Module):
                 nxt = self.get_char()
                 input_indices.append(current_wires[i] + nxt)
                 symbol = f"img_Ry_l{l}_{op_idx}"
-                tensor_arr.append((symbol, 'Ry'))
+                gate_arr.append({'name': symbol, 'op_type': 'Ry'})
                 self.sym2param[symbol] = symbol_idx
                 symbol_idx += 1
                 shape_arr.append([2, 2])
@@ -89,7 +89,7 @@ class QuantumFeatureMap(nn.Module):
                     c_out, t_out = self.get_char(), self.get_char()
                     input_indices.append(current_wires[c_idx] + current_wires[t_idx] + c_out + t_out)
                     symbol = f"img_CRz_l{l}_{op_idx}"
-                    tensor_arr.append((symbol, 'CRz'))
+                    gate_arr.append({'name': symbol, 'op_type': 'CRz'})
                     self.sym2param[symbol] = symbol_idx
                     symbol_idx += 1
                     shape_arr.append([2, 2, 2, 2])
@@ -97,7 +97,7 @@ class QuantumFeatureMap(nn.Module):
                     op_idx += 1
         
         einsum_str = f"{','.join(input_indices)}->b{''.join(current_wires)}"
-        self.gate_arr = tensor_arr
+        self.gate_arr = gate_arr
         self.einsum_expr = einsum_str
         self.contraction_path = contract_expression(einsum_str, *shape_arr)
 
@@ -115,8 +115,7 @@ class QuantumFeatureMap(nn.Module):
 
     def get_features(self, img_vecs):
         if self.neural:
-            if not torch.is_tensor(img_vecs):
-                img_vecs = torch.tensor(img_vecs, dtype=torch.float32, device=self.params.device)
+            img_vecs = torch.as_tensor(img_vecs, dtype=torch.float32, device=self.params.device)
             features = self.projector(img_vecs.view(img_vecs.shape[0], -1)) * torch.pi
         else:
             if torch.is_tensor(img_vecs):
@@ -129,10 +128,16 @@ class QuantumFeatureMap(nn.Module):
         return features 
     
     def encode_features(self, img_vec):
+        device = next(self.parameters()).device
+        img_vec = torch.as_tensor(img_vec, dtype=torch.float32, device=device)
+        is_1d = (img_vec.ndim == 1)
+        if is_1d: img_vec = img_vec.unsqueeze(0)
         features = self.get_features(img_vec)
+        if is_1d: features = features.squeeze(0)
         axis_map = {'Rx': 0, 'Ry': 1, 'Rz': 2}
         sym2ftr = {}
         for symbol, gate in self.gate_arr:
+            if gate == '0': continue
             parts = symbol.split('_')
             param_type = parts[0]
             if param_type == 'ftr':

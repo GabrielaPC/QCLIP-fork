@@ -1,4 +1,4 @@
-import argparse, logging, math, os, sys, time, yaml, torch
+import argparse, logging, math, os, sys, time, yaml, torch, traceback
 from pathlib import Path
 import numpy as np
 from tqdm import tqdm
@@ -27,7 +27,7 @@ def run_circuits(qc_array, sampler, shots):
     result_array = []
 
     primitive_result = job.result()
-    for job in primitive_result:
+    for job in tqdm(primitive_result):
         counts = job.join_data().get_counts()
         meas_qubits = len(next(iter(counts.items()))[0])
 
@@ -81,7 +81,7 @@ def main():
 
     compile_kwargs = {}
     if config["model_type"] == "vqc":
-        compile_kwargs["curry"] = config["compiler"].get("curry", False)
+        compile_kwargs["curry"] = config["text"].get("curry", False)
     compiled_eval = ansatz.compile_dataset(df_eval, **compile_kwargs)
 
     log_phase("Restoring Dynamic Parameter Spaces")
@@ -98,7 +98,7 @@ def main():
         sym_kwargs = {"id_init": True} if config["model_type"] == "vqc" else {}
         text_model.from_symbols(txt_stream, **sym_kwargs)
 
-    if hasattr(image_model, "fit_image_pca"):
+    if hasattr(image_model, "fit_image_pca") and config['vision']['neural'] == False:
         train_embeddings = torch.load(config["splits"]["train"]["img_path"])
         raw_tensor_stack = torch.stack(list(train_embeddings.values())).to(DEV)
         image_model.fit_image_pca(raw_tensor_stack)
@@ -125,7 +125,7 @@ def main():
         backend = FakeMiami()
         print(" Target Backend: FakeMiami (IBM Noise Blueprint Model)")
     else:
-        backend = AerSimulator()
+        backend = AerSimulator(method="matrix_product_state", device="GPU")
         print(" Target Backend: AerSimulator (Ideal State-Vector)")
 
     backend.set_options(max_parallel_threads=0, max_parallel_experiments=0)
@@ -141,7 +141,7 @@ def main():
             txt_params_dict[symbol] = float(text_model.params[idx].detach().cpu().item())
             
     img_params_dict = {}
-    use_ansatz = not config.get("use_clip", True)
+    use_ansatz = not config['vision'].get("use_clip", True)
     if use_ansatz and hasattr(image_model, "sym2param") and hasattr(image_model, "params"):
         for symbol, idx in image_model.sym2param.items():
             img_params_dict[symbol] = float(image_model.params[idx].detach().cpu().item())
@@ -160,8 +160,8 @@ def main():
     
     # 4. Assemble Circuit Suite using Evaluation Dataframe
     log_phase("Compiling Swap-Test Circuits")
-    pos_circs = []
-    neg_circs = []
+    pos_raw_circs = []
+    neg_raw_circs = []
     failed_circuits = 0
 
     data_size = len(swap_dataset)
@@ -172,86 +172,86 @@ def main():
     for idx in tqdm(range(data_size), desc="Compiling Qiskit DAGs", unit="pair"):
         try:
             sample = swap_dataset[idx]
-            caption = sample["caption"]
-            pos_img = sample["pos_img"]
-            neg_img = sample["neg_img"]
+            image = sample["image"]
+            pos_einsum, pos_wires = sample["pos_caption"][0], sample["pos_caption"][1]
+            neg_einsum, neg_wires = sample["neg_caption"][0], sample["neg_caption"][1]
 
             # 1. Generate Text Subcircuit Layout
-            qc_txt, output_qubits, params_dict = tn2qiskit(
-                einsum2interleaved(caption[0]), 
-                caption[1], 
-                meas_output=False, 
-                all_params_dict=txt_params_dict
+            qc_pos_txt, pos_output_qubits, pos_txt_params = tn2qiskit(
+                einsum2interleaved(pos_einsum), pos_wires, txt_params_dict, False
             )
+            for q_idx in range(qc_pos_txt.num_qubits):
+                if q_idx not in pos_output_qubits: qc_pos_txt.measure(q_idx, q_idx)
 
-            for q_idx in range(qc_txt.num_qubits):
-                if q_idx not in output_qubits:
-                    qc_txt.measure(q_idx, q_idx)
+            qc_neg_txt, neg_output_qubits, neg_txt_params = tn2qiskit(
+                einsum2interleaved(neg_einsum), neg_wires, txt_params_dict, False
+            )
+            for q_idx in range(qc_neg_txt.num_qubits):
+                if q_idx not in neg_output_qubits: qc_neg_txt.measure(q_idx, q_idx)
 
             if use_ansatz:
-                pos_params = img_params_dict | image_model.encode_features(pos_img)
-                qc_pos_img, _, _ = tn2qiskit(einsum2interleaved(image_model.einsum_expr), image_model.gate_arr, meas_output=False, all_params_dict=pos_params)
-                neg_params = img_params_dict | image_model.encode_features(neg_img)
-                qc_neg_img, _, _ = tn2qiskit(einsum2interleaved(image_model.einsum_expr), image_model.gate_arr, meas_output=False, all_params_dict=neg_params)
+                img_vars = img_params_dict | image_model.encode_features(image)
+                in_idx, out_idx = einsum2interleaved(image_model.einsum_expr.replace('b', ''))
+                qc_img, _, img_params = tn2qiskit([in_idx, out_idx], image_model.gate_arr, img_vars, False)
+                pos_params = pos_txt_params | img_params
+                neg_params = neg_txt_params | img_params
             else:
-                pos_vector = pos_img.cpu().numpy() if hasattr(pos_img, "cpu") else np.array(pos_img)
-                neg_vector = neg_img.cpu().numpy() if hasattr(neg_img, "cpu") else np.array(neg_img)
-                
-                normalized_pos = amplitude_encoding(pos_vector)
-                normalized_neg = amplitude_encoding(neg_vector)
-                
-                required_qubits = int(math.ceil(math.log2(len(normalized_pos))))
-                
-                qc_pos_img = QuantumCircuit(required_qubits, 0)
-                qc_pos_img.initialize(normalized_pos)
-                
-                qc_neg_img = QuantumCircuit(required_qubits, 0)
-                qc_neg_img.initialize(normalized_neg)
+                img_vec = image if isinstance(image, np.ndarray) else image.detach().cpu().numpy()
+                normed_img_vec = amplitude_encoding(img_vec)
+                required_qubits = int(math.ceil(math.log2(len(normed_img_vec))))
+                qc_img = QuantumCircuit(required_qubits, 0)
+                qc_img.initialize(normed_img_vec)
+
+                pos_params = pos_txt_params
+                neg_params = neg_txt_params
 
             # 3. Assemble Positive Swap Test Frame
-            qc_pos = qc_txt.copy()
-            qreg_txt = qc_pos.qregs[0]
-            qreg_img = qc_pos_img.qregs[0]
-            qreg_anc_pos = QuantumRegister(1, "q_anc")
-            creg_anc_pos = ClassicalRegister(1, "c_anc")
+            q_anc_p = QuantumRegister(1, "anc_pos")
+            q_txt_p = QuantumRegister(qc_pos_txt.num_qubits, "txt_pos")
+            q_img_p = QuantumRegister(qc_img.num_qubits, "img_pos")
+            
+            c_total_p = ClassicalRegister(qc_pos_txt.num_clbits + 1, "c_total_pos")
+            qc_pos = QuantumCircuit(q_anc_p, q_txt_p, q_img_p, c_total_p)
+            qc_pos.compose(qc_pos_txt, qubits=q_txt_p, clbits=range(qc_pos_txt.num_clbits), inplace=True)
+            qc_pos.compose(qc_img, qubits=q_img_p, inplace=True)
 
-            qc_pos.add_register(qreg_img, qreg_anc_pos, creg_anc_pos)
-            qc_pos.compose(qc_pos_img, qreg_img, inplace=True)
-
-            qc_pos.h(qreg_anc_pos)
-            for m_idx in range(len(output_qubits)):
-                qc_pos.cswap(qreg_anc_pos, qreg_txt[output_qubits[m_idx]], qreg_img[m_idx])
-            qc_pos.h(qreg_anc_pos)
-            qc_pos.measure(qreg_anc_pos, creg_anc_pos)
+            qc_pos.h(q_anc_p)
+            for m_idx in range(len(pos_output_qubits)):
+                qc_pos.cswap(q_anc_p[0], q_txt_p[pos_output_qubits[m_idx]], q_img_p[m_idx])
+            qc_pos.h(q_anc_p)
+            qc_pos.measure(q_anc_p, c_total_p[-1])
 
             # 4. Assemble Negative Swap Test Frame
-            qc_neg = qc_txt.copy()
-            qreg_txt_neg = qc_neg.qregs[0]
-            qreg_img_neg = qc_neg_img.qregs[0]
-            qreg_anc_neg = QuantumRegister(1, "q_anc")
-            creg_anc_neg = ClassicalRegister(1, "c_anc")
+            q_anc_n = QuantumRegister(1, "anc_neg")
+            q_txt_n = QuantumRegister(qc_neg_txt.num_qubits, "txt_neg")
+            q_img_n = QuantumRegister(qc_img.num_qubits, "img_neg")
 
-            qc_neg.add_register(qreg_img_neg, qreg_anc_neg, creg_anc_neg)
-            qc_neg.compose(qc_neg_img, qreg_img_neg, inplace=True)
+            c_total_n = ClassicalRegister(qc_neg_txt.num_clbits + 1, "c_total_neg")
+            qc_neg = QuantumCircuit(q_anc_n, q_txt_n, q_img_n, c_total_n)
+            qc_neg.compose(qc_neg_txt, qubits=q_txt_n, clbits=range(qc_neg_txt.num_clbits), inplace=True)
+            qc_neg.compose(qc_img, qubits=q_img_n, inplace=True)
             
-            qc_neg.h(qreg_anc_neg)
-            for m_idx in range(len(output_qubits)):
-                qc_neg.cswap(qreg_anc_neg, qreg_txt_neg[output_qubits[m_idx]], qreg_img_neg[m_idx])
-            qc_neg.h(qreg_anc_neg)
-            qc_neg.measure(qreg_anc_neg, creg_anc_neg)
+            qc_neg.h(q_anc_n)
+            for m_idx in range(len(neg_output_qubits)):
+                qc_neg.cswap(q_anc_n[0], q_txt_n[neg_output_qubits[m_idx]], q_img_n[m_idx])
+            qc_neg.h(q_anc_n)
+            qc_neg.measure(q_anc_n, c_total_n[-1])
 
             # Transpile directly for backend specifications
-            pos_circs.append(transpile(qc_pos, backend))
-            neg_circs.append(transpile(qc_neg, backend))
+            qc_pos_static = qc_pos.assign_parameters(pos_params)
+            qc_neg_static = qc_neg.assign_parameters(neg_params)
+            
+            pos_raw_circs.append(qc_pos_static)
+            neg_raw_circs.append(qc_neg_static)
 
         except Exception as e:
             failed_circuits += 1
             tqdm.write(f" Circuit compilation dropped at sample index {idx}: {e}")
-
-    if not pos_circs:
-        print(" Terminal Execution Halt: No valid quantum circuits were assembled.")
-        sys.exit(1)
+            tqdm.write(traceback.format_exc())
+            break
     
+    pos_circs = transpile(pos_raw_circs, backend, optimization_level=1)
+    neg_circs = transpile(neg_raw_circs, backend, optimization_level=1)
     log_phase("Executing Emulator Engine Pipeline")
     print(f" Simulating quantum states across {len(pos_circs)} pairs...")
 
@@ -270,3 +270,6 @@ def main():
     print(f"  {'Target Resolution (Shots)':<34} | {shots:.6f}")
     print(f"  {'Pipeline Cumulative Accuracy':<34} | \033[92m{cum_acc:.6f}\033[0m")
     print(" " + "—" * 53 + "\n")
+
+if __name__ == "__main__":
+    main()

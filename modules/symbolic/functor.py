@@ -18,12 +18,9 @@ def tree2einsum(root_node, simplify=True):
     while stack: 
         node, idx_arr = stack.pop()
         if node.rule == CCGRule.LEXICAL:
-            # tn[node.text] = (idx_arr, get_type(node.biclosed_type))
             tn.append((node.text, idx_arr, get_type(node.biclosed_type)))
+
         elif node.rule == CCGRule.FORWARD_APPLICATION:
-            # if node.left.biclosed_type.to_string() in ['(NP/N)', '(n/n)']:
-            #     stack.append((node.right, idx_arr))
-            #     continue
             N_L = len(get_type(node.left.biclosed_type))
             N_R = len(get_type(node.right.biclosed_type))
             shared_idx = [get_new_index() for _ in range(N_R)]
@@ -34,8 +31,8 @@ def tree2einsum(root_node, simplify=True):
             elif len(adjusted_idx_arr) > N_target_parent:
                 adjusted_idx_arr = adjusted_idx_arr[:N_target_parent]
 
-            stack.append((node.right, shared_idx))
             stack.append((node.left, adjusted_idx_arr + shared_idx[::-1]))
+            stack.append((node.right, shared_idx))
 
         elif node.rule == CCGRule.BACKWARD_APPLICATION:    
             N_L = len(get_type(node.left.biclosed_type))
@@ -49,8 +46,8 @@ def tree2einsum(root_node, simplify=True):
             elif len(adjusted_idx_arr) > N_target_parent:
                 adjusted_idx_arr = adjusted_idx_arr[:N_target_parent]
 
-            stack.append((node.right, shared_idx[::-1] + adjusted_idx_arr))
             stack.append((node.left, shared_idx))
+            stack.append((node.right, shared_idx[::-1] + adjusted_idx_arr))
 
         elif node.rule == CCGRule.REMOVE_PUNCTUATION_LEFT:
             stack.append((node.right, idx_arr))
@@ -87,8 +84,8 @@ def tree2einsum(root_node, simplify=True):
                 elif len(idx_Zrev) > N_Zrev:
                     idx_Zrev = idx_Zrev[:N_Zrev]
                     
-                stack.append((node.right, shared_idx + idx_Zrev))
                 stack.append((node.left, idx_X + shared_idx[::-1]))
+                stack.append((node.right, shared_idx + idx_Zrev))
 
             elif node.rule == CCGRule.BACKWARD_COMPOSITION: 
                 N_Z = N_L - N_Y
@@ -103,8 +100,8 @@ def tree2einsum(root_node, simplify=True):
                 elif len(idx_X) > N_X:
                     idx_X = idx_X[:N_X]
                     
-                stack.append((node.right, shared_idx[::-1] + idx_X))
                 stack.append((node.left, idx_Zrev + shared_idx))
+                stack.append((node.right, shared_idx[::-1] + idx_X))
 
             elif node.rule == CCGRule.FORWARD_CROSSED_COMPOSITION: 
                 N_Z = N_R - N_Y
@@ -119,8 +116,8 @@ def tree2einsum(root_node, simplify=True):
                 elif len(idx_X) > N_X:
                     idx_X = idx_X[:N_X]
                     
-                stack.append((node.right, idx_Zrev + shared_idx))
                 stack.append((node.left, idx_X + shared_idx[::-1]))
+                stack.append((node.right, idx_Zrev + shared_idx))
 
             elif node.rule == CCGRule.BACKWARD_CROSSED_COMPOSITION: 
                 N_X = N_R - N_Y
@@ -135,8 +132,8 @@ def tree2einsum(root_node, simplify=True):
                 elif len(idx_Zrev) > N_Zrev:
                     idx_Zrev = idx_Zrev[:N_Zrev]
                     
-                stack.append((node.right, shared_idx[::-1] + idx_X))
                 stack.append((node.left, shared_idx + idx_Zrev))
+                stack.append((node.right, shared_idx[::-1] + idx_X))
     
     return tn
 

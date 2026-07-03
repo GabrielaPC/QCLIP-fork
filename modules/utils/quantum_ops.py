@@ -17,7 +17,14 @@ def qcosine(bstates1, bstates2, eps=1e-9):
     return inner_product.abs() / (norm1 * norm2 + eps)
 
 def amplitude_encoding(vector):
+    is_numpy = isinstance(vector, np.ndarray)
+    is_1d = (vector.ndim == 1)
+
+    if is_numpy: vector = torch.from_numpy(vector)
+    vector = vector.to(torch.float64)
     device = vector.device
+    if is_1d: vector = vector.unsqueeze(0)
+
     batch_size, dim = vector.shape
 
     num_qubits = math.ceil(math.log2(dim))
@@ -32,8 +39,16 @@ def amplitude_encoding(vector):
     safe_norm = torch.where(is_zero, torch.ones_like(norm), norm)
     state_vector = vector / safe_norm
 
-    state_vector[:, 0] = torch.where(is_zero.squeeze(-1), torch.tensor(1.0, device=device), state_vector[:, 0])
+    state_vector[:, 0] = torch.where(is_zero.squeeze(-1), 
+                                     torch.tensor(1.0, dtype=torch.float64, device=device), 
+                                     state_vector[:, 0])
     
+    final_norm = torch.linalg.vector_norm(state_vector, ord=2, dim=-1, keepdim=True)
+    state_vector = state_vector / final_norm
+    
+    if is_1d: state_vector = state_vector.squeeze(0)
+    if is_numpy: state_vector = state_vector.detach().cpu().numpy()
+
     return state_vector
 
 def tn2qiskit(einsum_expr, gate_arr, param_dict={}, meas_output=True):
@@ -72,6 +87,7 @@ def tn2qiskit(einsum_expr, gate_arr, param_dict={}, meas_output=True):
                 gate_func(param, *q_targets)
                 if gate['name'] not in param_dict:
                     qiskit_param_dict[param] = np.random.rand() * 2 * np.pi
+                    # print(f"Warning: Parameter '{gate['name']}' not found in param_dict. Using random value {qiskit_param_dict[param]:.4f}.")
                 else:
                     qiskit_param_dict[param] = param_dict[gate['name']]
 
@@ -92,4 +108,4 @@ def tn2qiskit(einsum_expr, gate_arr, param_dict={}, meas_output=True):
                 qc.measure(q_out, q_out)
             output_qubits.append(q_out)
     
-    return qc, output_qubits, param_dict
+    return qc, output_qubits, qiskit_param_dict

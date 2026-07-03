@@ -45,7 +45,7 @@ if __name__ == "__main__":
 
     compile_kwargs = {}
     if config["model_type"] == "vqc":
-        compile_kwargs["curry"] = config["compiler"].get("curry", False)
+        compile_kwargs["curry"] = config["text"].get("curry", False)
     compiled_eval = ansatz.compile_dataset(df_eval, **compile_kwargs)
 
     log_phase("Restoring Dynamic Parameter Spaces")
@@ -63,7 +63,7 @@ if __name__ == "__main__":
         sym_kwargs = {"id_init": True} if config["model_type"] == "vqc" else {}
         text_model.from_symbols(txt_stream, **sym_kwargs)
 
-    if hasattr(image_model, "fit_image_pca"):
+    if hasattr(image_model, "fit_image_pca") and config['vision']['neural'] == False:
         train_embeddings = torch.load(config["splits"]["train"]["img_path"])
         raw_tensor_stack = torch.stack(list(train_embeddings.values())).to(DEV)
         image_model.fit_image_pca(raw_tensor_stack)
@@ -80,7 +80,7 @@ if __name__ == "__main__":
     saved_epoch = checkpoint.get("epoch", "N/A")
     saved_loss = checkpoint.get("train_loss", "N/A")
 
-    print(f"    [Checkpoint Info] -> Recovered from Epoch: {saved_epoch} | Historical Loss: {saved_loss}")
+    print(f" [Checkpoint Info] -> Recovered from Epoch: {saved_epoch} | Historical Loss: {saved_loss}")
 
     image_model.eval()
     text_model.eval()
@@ -101,6 +101,7 @@ if __name__ == "__main__":
         num_workers=4, 
         pin_memory=True
     )
+    print(f" Evaluation DataLoader ready: {len(eval_loader)} steps | Batch Size: {config['batch_size']}")
 
     log_phase("Executing Metrics Benchmark Suite")
     evaluator = MMEvaluator(image_model, text_model, DEV)
