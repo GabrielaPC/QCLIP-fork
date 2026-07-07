@@ -142,6 +142,38 @@ class BaseAnsatz(ABC):
         einsum_expr = self.gen_einsum_expr(input_indices, ccg_map)
         return einsum_expr, tensor_arr
     
+    def spider(self, tn):
+        self.reset_char()
+        ccg_map = {}
+        input_indices, tensor_arr = [], []
+
+        idx = 0
+        N = self.obmap.get('out', 1)
+        for word, _, type_arr in tn:
+            current_wires = [self.get_char() for _ in range(N)]
+
+            for w in current_wires:
+                input_indices.append([w])
+                tensor_arr.append({'name': None, 'op_type': '0'})
+
+            base_symbol = f"{word}__{'@'.join(type_arr)}"
+            current_wires, new_indices, new_tensors = self.ansatz(current_wires, base_symbol)
+            input_indices.extend(new_indices)
+            tensor_arr.extend(new_tensors)
+
+            ccg_map[idx] = current_wires
+            idx += 1
+
+        target_wires = ccg_map[idx]                    
+        replace_map = {}
+        for i in range(idx):
+            for output_wires in ccg_map[i]:
+                replace_map[output_wires] = target_wires
+        input_indices = [[replace_map.get(w, w) for w in sub] for sub in input_indices]
+
+        einsum_expr = self.gen_einsum_expr(input_indices, ccg_map)
+        return einsum_expr, tensor_arr
+
     def compile_dataset(self, df, curry=False):
         #blueprint_df = pd.DataFrame(index=df.index)
         cols = [col for col in df.columns if col.endswith('_diagram')]

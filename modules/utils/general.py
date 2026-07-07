@@ -51,7 +51,15 @@ def log_phase(name: str):
 
 def serialise_subsapce(sub_config):
     identity_keys = ['layers', 'hidden_dim', 'n', 'p', 's', 'bond_dim', 'max_order']
-    parts = []
+    tags = ['method']
+    if 'method' in sub_config:
+        if sub_config['method'] == 'amp':
+            identity_keys = ['hidden_dim', 'n', 'p', 's', 'bond_dim', 'max_order']
+        parts = [f"{sub_config['method']}"]
+    elif 'curry' in sub_config and sub_config['curry']:
+        parts = ['cur']
+    else:
+        parts = []
     for key in identity_keys:
         if key in sub_config:
             val = sub_config[key]

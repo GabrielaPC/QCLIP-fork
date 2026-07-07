@@ -3,20 +3,25 @@ batch_size: 256
 learning_rate: 0.001
 epochs: 100
 embedding_qubits: 9
+
 emulation_set: "swap"
+backend: "AER"
+noise: false
+aer_dev: "GPU"
 
 text:
   ansatz: "custom_v5"
-  n: 3
-  s: 3
-  p: 3
-  layers: 3
+  n: 1
+  s: 1
+  p: 1
+  layers: 2
   curry: true
 
 vision:
   layers: 5
-  neural: true
-  use_clip: false
+  method: 'amp' # 'amp' or 'pca' or 'mlp'
+
+test_task: "evaluate_text_choice"
 
 dataset:
   name: "aro"
@@ -24,6 +29,9 @@ dataset:
   class: "modules.data_pipeline.datasets.ARODataset"
   collate_fn: "modules.data_pipeline.datasets.aro_collate_fn"
   eval_mapper: "modules.models.fusion.engine.aro_mapper"
+  eval_tasks: 
+    - "evaluate_text_choice"
+    - "compositional_diagnostic"
 
 splits:
   train:
@@ -32,8 +40,11 @@ splits:
   val:
     text_path: "data/aro/processed/val.pkl"
     img_path: "data/aro/processed/image_embeddings.pt"
-  test:
-    text_path: "data/aro/processed/test.pkl"
+  test_att:
+    text_path: "data/aro/processed/test_att.pkl"
+    img_path: "data/aro/processed/image_embeddings.pt"
+  test_rel:
+    text_path: "data/aro/processed/test_rel.pkl"
     img_path: "data/aro/processed/image_embeddings.pt"
 
 # dataset:
@@ -42,6 +53,9 @@ splits:
 #   class: "modules.data_pipeline.datasets.SVODataset"
 #   collate_fn: "modules.data_pipeline.datasets.svo_collate_fn"
 #   eval_mapper: "modules.models.fusion.engine.svo_mapper"
+#   eval_tasks: 
+#    - "evaluate_image_choice"
+#    - "compositional_diagnostic"
 
 # splits:
 #   train:
@@ -56,7 +70,3 @@ splits:
 #   swap:
 #     text_path: "data/svo-probes/processed/swap.pkl"
 #     img_path: "data/svo-probes/processed/image_embeddings.pt"
-
-evaluation_tasks:
-  - "evaluate_image_choice"
-  - compositional_diagnostic

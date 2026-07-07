@@ -12,6 +12,7 @@ from factory import build_dataset, build_experiment
 from modules.models.fusion.engine import MMEvaluator
 from modules.utils.general import get_device, load_pkl
 from modules.data_pipeline.datasets import SwapDataset, swap_collate_fn
+from modules.utils.analysis import tn_metadata, analyse_einsum
 
 def log_phase(name: str):
     print(f"\n[{name.upper()}] " + "—" * (60 - len(name)))
@@ -40,13 +41,9 @@ if __name__ == "__main__":
     ansatz, image_model, text_model, _ = build_experiment(config, DEV)
     DatasetClass, collate_fn, eval_mapper = build_dataset(config)
 
-    log_phase("Compiling Evaluation Graph Structures")
-    df_eval = load_pkl(config["splits"]['swap']["text_path"])
-
     compile_kwargs = {}
     if config["model_type"] == "vqc":
         compile_kwargs["curry"] = config["text"].get("curry", False)
-    compiled_eval = ansatz.compile_dataset(df_eval, **compile_kwargs)
 
     log_phase("Restoring Dynamic Parameter Spaces")
 
@@ -57,16 +54,31 @@ if __name__ == "__main__":
 
     if hasattr(text_model, "from_symbols"):
         sym_cols = [c for c in compiled_train.columns if c.endswith("_symbols")]
-        txt_stream = []
+        symbol_arr = []
         for col in sym_cols:
-            txt_stream += compiled_train[col].tolist() + compiled_val[col].tolist()
+            symbol_arr += compiled_train[col].tolist() + compiled_val[col].tolist()
         sym_kwargs = {"id_init": True} if config["model_type"] == "vqc" else {}
-        text_model.from_symbols(txt_stream, **sym_kwargs)
+        text_model.from_symbols(symbol_arr, **sym_kwargs)
 
-    if hasattr(image_model, "fit_image_pca") and config['vision']['neural'] == False:
+        einsum_cols = [c for c in compiled_train.columns if c.endswith("_einsum")]
+        einsum_arr = []
+        for col in einsum_cols:
+            einsum_arr += compiled_train[col].tolist() + compiled_val[col].tolist()
+
+        tn_arr = list(zip(einsum_arr, symbol_arr))
+        metrics = tn_metadata(tn_arr)
+        print(f"Circuit Metrics for Text Model:")
+        print(f"(Max) Qubits: {metrics['max'][0]:.4f} | Gates: {metrics['max'][1]:.4f} | Depth: {metrics['max'][2]:.4f} | Rank: {metrics['max'][3]:.4f}")
+        print(f"(Avg) Qubits: {metrics['avg'][0]:.4f} | Gates: {metrics['avg'][1]:.4f} | Depth: {metrics['avg'][2]:.4f} | Rank: {metrics['avg'][3]:.4f}")
+
+    if config['vision']['method'] == 'pca':
         train_embeddings = torch.load(config["splits"]["train"]["img_path"])
         raw_tensor_stack = torch.stack(list(train_embeddings.values())).to(DEV)
         image_model.fit_image_pca(raw_tensor_stack)
+    if config['vision']['method'] in ['mlp', 'pca']:
+        metrics = analyse_einsum(image_model.einsum_expr.replace('b', ''), image_model.gate_arr)
+        print(f"Circuit Metrics for Image Model:")
+        print(f"Qubits: {metrics[0]:.4f} | Gates: {metrics[1]:.4f} | Depth: {metrics[2]:.4f} | Rank: {metrics[3]:.4f}")
 
     log_phase("Loading Model Checkpoint Weights")
     checkpoint = torch.load(checkpoint_path, map_location=DEV)
@@ -86,17 +98,27 @@ if __name__ == "__main__":
     text_model.eval()
 
     log_phase("Constructing Data Engine Context")
-    if config['vision']['use_clip']:
+    if config['vision']['method'] == 'amp':
         img_transform = None
     else:
         img_transform = v2.Compose([v2.ToImage(),               
                                     v2.ToDtype(torch.float32, scale=True),
                                     v2.Resize((64, 64))])
         
+
+    log_phase("Compiling Evaluation Graph Structures")
+    if config["splits"].get("swap", None) is not None:
+        DatasetClass = SwapDataset
+        collate_fn = swap_collate_fn
+        split = config["splits"]["swap"]
+    else:
+        split = config["splits"]["test"]
+    df_eval = load_pkl(split["text_path"])
+    compiled_eval = ansatz.compile_dataset(df_eval, **compile_kwargs)
     eval_loader = DataLoader(
-        SwapDataset(compiled_eval, config["splits"]['swap']["img_path"], image_transform=img_transform),
+        DatasetClass(compiled_eval, split["img_path"], image_transform=img_transform),
         batch_size=config["batch_size"], 
-        collate_fn=swap_collate_fn, 
+        collate_fn=collate_fn, 
         shuffle=False, 
         num_workers=4, 
         pin_memory=True
@@ -105,12 +127,12 @@ if __name__ == "__main__":
 
     log_phase("Executing Metrics Benchmark Suite")
     evaluator = MMEvaluator(image_model, text_model, DEV)
-
+    eval_fn = getattr(evaluator, config['test_task'], None)
     metrics = {}
 
     with torch.no_grad():
         start_task = time.time()
-        task_metrics = evaluator.evaluate_swap(eval_loader)
+        task_metrics = eval_fn(eval_loader)
         metrics.update(task_metrics)
         elapsed = time.time() - start_task
         print(f"    Completed in {elapsed:.2f}s")

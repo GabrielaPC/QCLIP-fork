@@ -14,7 +14,10 @@ def tn_metadata(data_arr):
     avg_nq = avg_gates = avg_width = avg_cdepth = 0
     N = len(data_arr)
     path_cache = {}
+    i = 0
     for einsum_expr, tarr in tqdm(data_arr):
+        i += 1
+        # try:
         nq, ngates, cdepth, width = analyse_einsum(einsum_expr, tarr, cache=path_cache)
         max_nq = max(max_nq, nq)
         max_gates = max(max_gates, ngates)
@@ -24,6 +27,9 @@ def tn_metadata(data_arr):
         avg_gates += ngates
         avg_cdepth += cdepth
         avg_width += width
+        # except Exception as e:
+        #     print(f"Error analyzing einsum: {i} with error: {e}")
+        #     continue
     avg_width /= N
     avg_nq /= N
     avg_cdepth /= N
@@ -41,7 +47,7 @@ def analyse_einsum(einsum_expr, tarr, cache={}):
     shapes = []
     nq = 0
 
-    input_subs, output_sub = einsum2interleaved(einsum_expr)
+    input_subs = einsum_expr.split('->')[0]
             
     for subscript, gate in zip(input_subs, tarr):
         symbol, op_type = gate['name'], gate['op_type']
@@ -58,7 +64,7 @@ def analyse_einsum(einsum_expr, tarr, cache={}):
             elif op_type in ['CRz', 'CRx', 'CRy']: data_shape = torch.Size([2, 2, 2, 2])
         shapes.append(data_shape)
 
-        if op_type not in ['0', 'sqrt']:
+        if op_type not in ['0']:
             current_gate_max = 0
             for char in subscript:
                 current_gate_max = max(current_gate_max, qubit_depths[char])
@@ -67,15 +73,8 @@ def analyse_einsum(einsum_expr, tarr, cache={}):
                 qubit_depths[char] = new_depth
 
     cdepth = max(qubit_depths.values()) if qubit_depths else 0
-    # opt = ctg.HyperOptimizer(methods=['kahypar', 'greedy'], max_repeats=16, parallel=True)
-    # tree = ctg.einsum_tree(einsum_str, *[tuple(int(d) for d in s) for s in shapes], optimize=opt)
-    # max_width = tree.contraction_width()
-    interleaved_args = []
-    for shape, sub in zip(shapes, input_subs):
-        interleaved_args.append(shape)
-        interleaved_args.append(sub)
-    interleaved_args.append(output_sub)
-    path_info = contract_path(*interleaved_args, shapes=True)
+    # dummy_operands = [np.empty(tuple(s), dtype=np.int8) for s in shapes]
+    path_info = contract_path(einsum_expr, *shapes, shapes=True)
     max_width = int(np.log2(float(path_info[1].largest_intermediate)))
     ngates = len(tarr) - nq
     cache[cache_key] = (nq, ngates, cdepth, max_width)

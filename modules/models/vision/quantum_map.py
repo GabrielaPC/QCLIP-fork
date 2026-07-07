@@ -7,7 +7,7 @@ from opt_einsum import contract_expression
 from modules.compilation.quantum.gates import *
 
 class QuantumFeatureMap(nn.Module):
-    def __init__(self, k: int, layers: int, batch_size: int, id_init=False, neural=False):
+    def __init__(self, k: int, layers: int, batch_size: int, id_init=False, method='mlp'):
         super().__init__()
         self.k = k
         self.out_dim = 2 ** k
@@ -15,9 +15,9 @@ class QuantumFeatureMap(nn.Module):
         self.batch_size = batch_size
         self.params = nn.ParameterList([])
         self.sym2param = {}
-        self.neural = neural
+        self.method = method
 
-        if self.neural:
+        if self.method == 'mlp':
             self.projector = nn.Sequential(
                 nn.Linear(self.out_dim, self.out_dim // 2),
                 nn.LayerNorm(self.out_dim // 2),
@@ -26,7 +26,7 @@ class QuantumFeatureMap(nn.Module):
             )
             nn.init.uniform_(self.projector[3].weight, a=-1e-4, b=1e-4)
             nn.init.zeros_(self.projector[3].bias)
-        else:
+        if self.method == 'pca':
             self.pca = IncrementalPCA(n_components= 3 * k * layers)
 
         self.compile_fmap()
@@ -114,10 +114,10 @@ class QuantumFeatureMap(nn.Module):
         self.global_pca_max = np.max(np.abs(self.pca.transform(np.array(batch))))
 
     def get_features(self, img_vecs):
-        if self.neural:
+        if self.method == 'mlp':
             img_vecs = torch.as_tensor(img_vecs, dtype=torch.float32, device=self.params.device)
             features = self.projector(img_vecs.view(img_vecs.shape[0], -1)) * torch.pi
-        else:
+        if self.method == 'pca':
             if torch.is_tensor(img_vecs):
                 flat_vector = img_vecs.detach().cpu().numpy().reshape(len(img_vecs), -1)
             else:
@@ -136,7 +136,8 @@ class QuantumFeatureMap(nn.Module):
         if is_1d: features = features.squeeze(0)
         axis_map = {'Rx': 0, 'Ry': 1, 'Rz': 2}
         sym2ftr = {}
-        for symbol, gate in self.gate_arr:
+        for item in self.gate_arr:
+            symbol, gate = item['name'], item['op_type']
             if gate == '0': continue
             parts = symbol.split('_')
             param_type = parts[0]
@@ -155,7 +156,8 @@ class QuantumFeatureMap(nn.Module):
         
         tensor_arr = []
         axis_map = {'Rx': 0, 'Ry': 1, 'Rz': 2}
-        for symbol, gate in self.gate_arr:
+        for item in self.gate_arr:
+            symbol, gate = item['name'], item['op_type']
             if gate == '0':
                 tensor_arr.append(torch.tensor([1, 0], dtype=torch.complex64, device=self.params.device))
                 continue

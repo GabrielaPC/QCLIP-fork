@@ -16,6 +16,7 @@ checkpoints/
 _*
 modules_v2/
 playground/
+logs/
 notebooks/playground/
 /.*
 

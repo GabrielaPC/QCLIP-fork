@@ -151,16 +151,17 @@ class MMEvaluator:
             pos_txt_emb = self._encode_txt(batch["pos_caption"])
             neg_txt_emb = self._encode_txt(batch["neg_caption"])
             
-            pos_sim = torch.sum(img_emb * pos_txt_emb, dim=1)
-            neg_sim = torch.sum(img_emb * neg_txt_emb, dim=1)
+            pos_sim = torch.sum(img_emb * pos_txt_emb, dim=1).abs()
+            neg_sim = torch.sum(img_emb * neg_txt_emb, dim=1).abs()
             
             correct += (pos_sim > neg_sim).sum().item()
             total += img_emb.size(0)
-        return {"text_choice": correct / total}
-
+        return {"acc": correct / total}
 
     @torch.no_grad()
     def evaluate_image_choice(self, dataloader) -> float:
+        self.image_model.eval()
+        self.text_model.eval()
         correct = total = 0
         for batch in dataloader:
             txt_emb = self._encode_txt(batch["caption"])
@@ -173,7 +174,7 @@ class MMEvaluator:
             correct += (pos_sim > neg_sim).sum().item()
             total += txt_emb.size(0)
         return {"acc": correct / total}
-    
+
     @torch.no_grad()
     def evaluate_sugarcrepe_pp(self, dataloader: torch.utils.data.DataLoader) -> float:
         correct = total = 0
@@ -183,9 +184,9 @@ class MMEvaluator:
             pos2_emb = self._encode_txt(batch["pos_caption2"])
             neg_emb = self._encode_txt(batch["neg_caption"])
             
-            sim_pos1 = torch.sum(img_emb * pos1_emb, dim=1)
-            sim_pos2 = torch.sum(img_emb * pos2_emb, dim=1)
-            sim_neg  = torch.sum(img_emb * neg_emb, dim=1)
+            sim_pos1 = torch.sum(img_emb * pos1_emb, dim=1).abs()
+            sim_pos2 = torch.sum(img_emb * pos2_emb, dim=1).abs()
+            sim_neg  = torch.sum(img_emb * neg_emb, dim=1).abs()
             
             match = (sim_pos1 > sim_neg) & (sim_pos2 > sim_neg)
             correct += match.sum().item()
@@ -200,10 +201,10 @@ class MMEvaluator:
             i0, c0 = self._encode_img(batch["image_0"]), self._encode_txt(batch["caption_0"])
             i1, c1 = self._encode_img(batch["image_1"]), self._encode_txt(batch["caption_1"])
             
-            s_i0_c0 = torch.sum(i0 * c0, dim=1)
-            s_i0_c1 = torch.sum(i0 * c1, dim=1)
-            s_i1_c0 = torch.sum(i1 * c0, dim=1)
-            s_i1_c1 = torch.sum(i1 * c1, dim=1)
+            s_i0_c0 = torch.sum(i0 * c0, dim=1).abs()
+            s_i0_c1 = torch.sum(i0 * c1, dim=1).abs()
+            s_i1_c0 = torch.sum(i1 * c0, dim=1).abs()
+            s_i1_c1 = torch.sum(i1 * c1, dim=1).abs()
 
             t_match = (s_i0_c0 > s_i0_c1) & (s_i1_c1 > s_i1_c0)
             i_match = (s_i0_c0 > s_i1_c0) & (s_i1_c1 > s_i0_c1)
@@ -217,28 +218,7 @@ class MMEvaluator:
         return {"txt_score": text_corr/total, "img_score": img_corr/total, "grp_score": group_corr/total}
     
     @torch.no_grad()
-    def evaluate_swap(self, dataloader) -> float:
-        self.image_model.eval()
-        self.text_model.eval()
-        correct = total = 0
-        for batch in dataloader:
-            img_emb = self._encode_img(batch["image"])
-            pos_txt_emb = self._encode_txt(batch["pos_caption"])
-            neg_txt_emb = self._encode_txt(batch["neg_caption"])
-            
-            pos_sim = torch.sum(img_emb * pos_txt_emb, dim=1).abs()
-            neg_sim = torch.sum(img_emb * neg_txt_emb, dim=1).abs()
-            
-            correct += (pos_sim > neg_sim).sum().item()
-            total += img_emb.size(0)
-        return {"swap_acc": correct / total}
-    
-    @torch.no_grad()
-    def compositional_diagnostic(self, dataloader, labels=None):
-        if not labels:
-            labels = ['m1', 'm2_pos', 'm2_neg']
-            raise ValueError("label_map must be provided for this method." \
-            "Requires: 'm1' for first fixed modality, 'm2_pos' for positive second modality, and 'm2_neg' for negative second modality.")
+    def compositional_diagnostic(self, dataloader, choice="text") -> dict:
         self.image_model.eval()
         self.text_model.eval()
 
@@ -248,12 +228,15 @@ class MMEvaluator:
         total_samples = 0
 
         for batch in dataloader:
-            # txt_emb = self._encode_txt(batch["caption"])
-            # pos_img_emb = self._encode_img(batch["pos_image"])
-            # neg_img_emb = self._encode_img(batch["neg_image"])
-            m1_emb = self._encode_txt(batch[labels[0]])
-            pos_m2_emb = self._encode_img(batch[labels[1]])
-            neg_m2_emb = self._encode_img(batch[labels[2]])
+            if choice == "text":
+                m1_emb = self._encode_img(batch["image"])
+                pos_m2_emb = self._encode_txt(batch["pos_caption"])
+                neg_m2_emb = self._encode_txt(batch["neg_caption"])
+            elif choice == "image":
+                m1_emb = self._encode_txt(batch["caption"])
+                pos_m2_emb = self._encode_img(batch["pos_image"])
+                neg_m2_emb = self._encode_img(batch["neg_image"])
+
             
             # Replicating your model's native similarity metric calculation
             pos_sim = torch.sum(m1_emb * pos_m2_emb, dim=1).abs()

@@ -14,6 +14,7 @@ from modules.models.vision.image_model import TTNImageModel
 
 from modules.models.fusion.criteria import FS_InfoNCE, InfoNCE
 import importlib
+import torch
 
 def load_obj(import_str: str):
     module_path, attr_name = import_str.rsplit('.', 1)
@@ -40,7 +41,7 @@ def build_experiment(config, device):
         ansatz = TNCompiler(obmap=obmap, decomp_fn=mps_proc)
         
         # 2. Models
-        if config['vision']['use_clip']:
+        if config['vision']['method'] == 'amp':
             image_model = FrozenCLIP().to(device)
         else:
             image_model = TTNImageModel(embedding_dim=config['embedding_dim']).to(device)
@@ -56,18 +57,19 @@ def build_experiment(config, device):
         ansatz = CustomV5Ansatz(obmap=obmap, layers=compiler['layers'])
         
         # 2. Models
-        if config['vision']['use_clip']:
+        if config['vision']['method'] == 'amp':
             image_model = FrozenCLIP(classical=False).to(device)
         else:
-            image_model = QuantumFeatureMap(k=config['embedding_qubits'], layers=config['vision']['layers'], batch_size=config['batch_size'], id_init=True, neural=config['vision']['neural']).to(device)
+            image_model = QuantumFeatureMap(k=config['embedding_qubits'], layers=config['vision']['layers'], batch_size=config['batch_size'], id_init=True, method=config['vision']['method']).to(device)
         text_model = VQCModel(out_q=config['embedding_qubits']).to(device)
+        # text_model = torch.compile(text_model, mode="max-autotune")
         
         # 3. Loss
         loss_fn = FS_InfoNCE()
         
     elif model_type == "mlp":
         ansatz = MLPCompiler()
-        if config['vision']['use_clip']:
+        if config['vision']['method'] == 'amp':
             image_model = FrozenCLIP().to(device)
         else:
             image_model = TTNImageModel(embedding_dim=config['embedding_dim']).to(device)

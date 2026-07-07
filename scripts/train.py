@@ -7,6 +7,8 @@ from datetime import datetime
 from factory import build_experiment, build_dataset
 from modules.utils.general import load_pkl, get_device, set_seed, gen_id, log_phase
 from modules.models.fusion.engine import ContrastiveTrainer, MMEvaluator
+from modules.utils.analysis import tn_metadata, analyse_einsum
+
 
 from tqdm import tqdm
 
@@ -57,13 +59,24 @@ if __name__ == "__main__":
     log_phase("Initializing Model Parameters")
     if hasattr(text_model, "from_symbols"):
         cols = [col for col in compiled_train.columns if col.endswith('_symbols')]
-        txt_stream = []
+        symbol_arr = []
         for col in cols:
-            txt_stream += compiled_train[col].tolist() + compiled_val[col].tolist()
+            symbol_arr += compiled_train[col].tolist() + compiled_val[col].tolist()
         
         sym_kwargs = {"id_init": True} if config["model_type"] == "vqc" else {}
-        text_model.from_symbols(txt_stream, **sym_kwargs)
+        text_model.from_symbols(symbol_arr, **sym_kwargs)
         print(f" Text Model vocabulary locked: {len(text_model.symbols)} distinct symbols.")
+
+        einsum_cols = [c for c in compiled_train.columns if c.endswith("_einsum")]
+        einsum_arr = []
+        for col in einsum_cols:
+            einsum_arr += compiled_train[col].tolist() + compiled_val[col].tolist()
+
+        tn_arr = list(zip(einsum_arr, symbol_arr))
+        metrics = tn_metadata(tn_arr)
+        print(f"Circuit Metrics for Text Model:")
+        print(f"(Max) Qubits: {metrics['max'][0]:.4f} | Gates: {metrics['max'][1]:.4f} | Depth: {metrics['max'][2]:.4f} | Rank: {metrics['max'][3]:.4f}")
+        print(f"(Avg) Qubits: {metrics['avg'][0]:.4f} | Gates: {metrics['avg'][1]:.4f} | Depth: {metrics['avg'][2]:.4f} | Rank: {metrics['avg'][3]:.4f}")
 
     if hasattr(text_model, "from_plans"):
         cols = [col for col in compiled_train.columns if col.endswith('_einsum')]
@@ -73,15 +86,19 @@ if __name__ == "__main__":
         text_model.from_plans(list(plan_stream))
         print(f" Text Model Parameters mapped: {len(text_model.leaves)} Leaves | {len(text_model.mlps)} MLPs.")
 
-    if hasattr(image_model, "fit_image_pca") and config['vision']['neural'] == False:
+    if config['vision']['method'] == 'pca':
         train_embeddings = torch.load(config['splits']['train']['img_path'])
         image_model.fit_image_pca(torch.stack(list(train_embeddings.values())).to(DEV))
         print(" Visual projection layers calibrated via target PCA.")
-    print(f" Model Parameter Counts: Image={sum(p.numel() for p in image_model.parameters())} | Text={sum(p.numel() for p in text_model.parameters())}")
+    if config['vision']['method'] in ['mlp', 'pca']:
+        metrics = analyse_einsum(image_model.einsum_expr.replace('b', ''), image_model.gate_arr)
+        print(f"Circuit Metrics for Image Model:")
+        print(f"Qubits: {metrics[0]:.4f} | Gates: {metrics[1]:.4f} | Depth: {metrics[2]:.4f} | Rank: {metrics[3]:.4f}")
+    print(f" Model ({config['vision']['method']}) Parameter Counts: Image={sum(p.numel() for p in image_model.parameters())} | Text={sum(p.numel() for p in text_model.parameters())}")
 
     # Prepare data loaders and optimisers
     log_phase("Preparing Pipeline Execution")
-    if config['vision']['use_clip']:
+    if config['vision']['method'] == 'amp':
         img_transform = None
     else:
         img_transform = v2.Compose([v2.ToImage(),               
@@ -147,7 +164,7 @@ if __name__ == "__main__":
             elapsed_time = time.time() - start_time
 
             metrics = {}
-            tasks = config.get('evaluation_tasks', ['global_retrieval'])
+            tasks = config['dataset'].get('eval_tasks', ['global_retrieval'])
             for task_name in tasks:
                 eval_fn = getattr(evaluator, task_name, None)
                 if eval_fn is None:
@@ -157,7 +174,10 @@ if __name__ == "__main__":
                 if task_name == "global_retrieval":
                     task_metrics = eval_fn(val_loader, eval_mapper)
                 elif task_name == "compositional_diagnostic":
-                    task_metrics = eval_fn(val_loader, labels=config['dataset']['labels'])
+                    if config['dataset']['name'] == "aro":
+                        task_metrics = eval_fn(val_loader, choice='text')
+                    else:
+                        task_metrics = eval_fn(val_loader, choice='image')
                 else:
                     task_metrics = eval_fn(val_loader)
                 metrics.update(task_metrics)
