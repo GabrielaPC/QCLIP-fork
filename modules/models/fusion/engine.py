@@ -101,7 +101,7 @@ class MMEvaluator:
             txt_emb = self._encode_txt(text_payload_batch)
             all_txt.append(txt_emb.cpu())
 
-        similarity = (torch.cat(all_img, dim=0) @ torch.cat(all_txt, dim=0).T).abs()
+        similarity = (torch.cat(all_img, dim=0) @ torch.cat(all_txt, dim=0).conj().T).abs()
         n_imgs, m_txts = similarity.shape
 
         mask = torch.zeros((n_imgs, m_txts), dtype=torch.bool, device=similarity.device)
@@ -145,35 +145,55 @@ class MMEvaluator:
     def evaluate_text_choice(self, dataloader) -> float:
         self.image_model.eval()
         self.text_model.eval()
-        correct = total = 0
+        correct_final = total = 0
+
+        pos_arr, neg_arr = [], []
+        correct_arr, margin_arr = [], []
         for batch in dataloader:
             img_emb = self._encode_img(batch["image"])
             pos_txt_emb = self._encode_txt(batch["pos_caption"])
             neg_txt_emb = self._encode_txt(batch["neg_caption"])
             
-            pos_sim = torch.sum(img_emb * pos_txt_emb, dim=1).abs()
-            neg_sim = torch.sum(img_emb * neg_txt_emb, dim=1).abs()
+            pos_sim = torch.sum(img_emb.conj() * pos_txt_emb, dim=1).abs()
+            neg_sim = torch.sum(img_emb.conj() * neg_txt_emb, dim=1).abs()
+            pos_arr.extend(pos_sim.cpu().numpy())
+            neg_arr.extend(neg_sim.cpu().numpy())
             
-            correct += (pos_sim > neg_sim).sum().item()
+            margin = pos_sim - neg_sim
+            correct = (margin > 0).float()
+            correct_final += correct.sum().item()
+            margin_arr.extend(margin.cpu().numpy())
+            correct_arr.extend(correct.cpu().numpy())
+
             total += img_emb.size(0)
-        return {"acc": correct / total}
+        return {"acc": correct_final / total}, {"pos_scores": pos_arr, "neg_scores": neg_arr, "margins": margin_arr, "correct": correct_arr}
 
     @torch.no_grad()
     def evaluate_image_choice(self, dataloader) -> float:
         self.image_model.eval()
         self.text_model.eval()
-        correct = total = 0
+        correct_final = total = 0
+
+        pos_arr, neg_arr = [], []
+        correct_arr, margin_arr = [], []
         for batch in dataloader:
             txt_emb = self._encode_txt(batch["caption"])
             pos_img_emb = self._encode_img(batch["pos_image"])
             neg_img_emb = self._encode_img(batch["neg_image"])
             
-            pos_sim = torch.sum(txt_emb * pos_img_emb, dim=1).abs()
-            neg_sim = torch.sum(txt_emb * neg_img_emb, dim=1).abs()
+            pos_sim = torch.sum(txt_emb.conj() * pos_img_emb, dim=1).abs()
+            neg_sim = torch.sum(txt_emb.conj() * neg_img_emb, dim=1).abs()
+            pos_arr.extend(pos_sim.cpu().numpy())
+            neg_arr.extend(neg_sim.cpu().numpy())
             
-            correct += (pos_sim > neg_sim).sum().item()
+            margin = pos_sim - neg_sim
+            correct = (margin > 0).float()
+            correct_final += correct.sum().item()
+            margin_arr.extend(margin.cpu().numpy())
+            correct_arr.extend(correct.cpu().numpy())
+
             total += txt_emb.size(0)
-        return {"acc": correct / total}
+        return {"acc": correct_final / total}, {"pos_scores": pos_arr, "neg_scores": neg_arr, "margins": margin_arr, "correct": correct_arr}
 
     @torch.no_grad()
     def evaluate_sugarcrepe_pp(self, dataloader: torch.utils.data.DataLoader) -> float:
@@ -184,9 +204,9 @@ class MMEvaluator:
             pos2_emb = self._encode_txt(batch["pos_caption2"])
             neg_emb = self._encode_txt(batch["neg_caption"])
             
-            sim_pos1 = torch.sum(img_emb * pos1_emb, dim=1).abs()
-            sim_pos2 = torch.sum(img_emb * pos2_emb, dim=1).abs()
-            sim_neg  = torch.sum(img_emb * neg_emb, dim=1).abs()
+            sim_pos1 = torch.sum(img_emb.conj() * pos1_emb, dim=1).abs()
+            sim_pos2 = torch.sum(img_emb.conj() * pos2_emb, dim=1).abs()
+            sim_neg  = torch.sum(img_emb.conj() * neg_emb, dim=1).abs()
             
             match = (sim_pos1 > sim_neg) & (sim_pos2 > sim_neg)
             correct += match.sum().item()
@@ -201,10 +221,10 @@ class MMEvaluator:
             i0, c0 = self._encode_img(batch["image_0"]), self._encode_txt(batch["caption_0"])
             i1, c1 = self._encode_img(batch["image_1"]), self._encode_txt(batch["caption_1"])
             
-            s_i0_c0 = torch.sum(i0 * c0, dim=1).abs()
-            s_i0_c1 = torch.sum(i0 * c1, dim=1).abs()
-            s_i1_c0 = torch.sum(i1 * c0, dim=1).abs()
-            s_i1_c1 = torch.sum(i1 * c1, dim=1).abs()
+            s_i0_c0 = torch.sum(i0.conj() * c0, dim=1).abs()
+            s_i0_c1 = torch.sum(i0.conj() * c1, dim=1).abs()
+            s_i1_c0 = torch.sum(i1.conj() * c0, dim=1).abs()
+            s_i1_c1 = torch.sum(i1.conj() * c1, dim=1).abs()
 
             t_match = (s_i0_c0 > s_i0_c1) & (s_i1_c1 > s_i1_c0)
             i_match = (s_i0_c0 > s_i1_c0) & (s_i1_c1 > s_i0_c1)
@@ -239,8 +259,8 @@ class MMEvaluator:
 
             
             # Replicating your model's native similarity metric calculation
-            pos_sim = torch.sum(m1_emb * pos_m2_emb, dim=1).abs()
-            neg_sim = torch.sum(m1_emb * neg_m2_emb, dim=1).abs()
+            pos_sim = torch.sum(m1_emb.conj() * pos_m2_emb, dim=1).abs()
+            neg_sim = torch.sum(m1_emb.conj() * neg_m2_emb, dim=1).abs()
             
             # Compute the absolute distance between the positive and negative scores per sample
             batch_gap = (pos_sim - neg_sim).abs()

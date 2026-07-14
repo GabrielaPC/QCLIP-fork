@@ -14,14 +14,16 @@ class BaseAnsatz(ABC):
         self.id = type(self).__name__ + '_' + str(obmap['n']) + '_' + str(obmap['s']) + '_' + str(obmap['p']) + '_' + str(obmap['out'])
         self.char_idx = count(0)
 
-    def __call__(self, tn, curry=False):
+    def __call__(self, tn, curry=False, spider=False):
         if curry:
             return self.tn2ansatz_curried(tn)
+        elif spider:
+            return self.spider(tn)
         else:
             return self.tn2ansatz(tn)
 
-    def tns2ansatze(self, tn_arr, curry=False):
-        return [self(tn, curry=curry) for tn in tn_arr]
+    def tns2ansatze(self, tn_arr, curry=False, spider=False):
+        return [self(tn, curry=curry, spider=spider) for tn in tn_arr]
 
     def reset_char(self):
         self.char_idx = count(0)
@@ -164,17 +166,20 @@ class BaseAnsatz(ABC):
             ccg_map[idx] = current_wires
             idx += 1
 
-        target_wires = ccg_map[idx]                    
+        target_wires = ccg_map[0]                    
         replace_map = {}
         for i in range(idx):
-            for output_wires in ccg_map[i]:
-                replace_map[output_wires] = target_wires
+            for j, output_wires in enumerate(ccg_map[i]):
+                replace_map[output_wires] = target_wires[j]
         input_indices = [[replace_map.get(w, w) for w in sub] for sub in input_indices]
-
+        for i in range(idx):
+            ccg_map[i] = target_wires
         einsum_expr = self.gen_einsum_expr(input_indices, ccg_map)
+        lhs, _ = einsum_expr.split('->')
+        einsum_expr = f"{lhs}->{''.join(target_wires)}"
         return einsum_expr, tensor_arr
 
-    def compile_dataset(self, df, curry=False):
+    def compile_dataset(self, df, curry=False, spider=False):
         #blueprint_df = pd.DataFrame(index=df.index)
         cols = [col for col in df.columns if col.endswith('_diagram')]
         for col in cols:
@@ -193,13 +198,13 @@ class BaseAnsatz(ABC):
                 if is_nested_list:
                     row_einsums, row_symbols = [], []
                     for tn in row_val:
-                        e_str, syms = self(tn, curry)
+                        e_str, syms = self(tn, curry, spider)
                         row_einsums.append(e_str)
                         row_symbols.append(syms)
                     einsum_arr.append(row_einsums)
                     symbols_arr.append(row_symbols)
                 else:
-                    e_str, syms = self(row_val, curry)
+                    e_str, syms = self(row_val, curry, spider)
                     einsum_arr.append(e_str)
                     symbols_arr.append(syms)
             df[einsum_col] = einsum_arr

@@ -8,7 +8,8 @@ import torch.nn.functional as F
 
 def fs_distance(state1, state2):
     inner_product = torch.sum(state1 * state2.conj(), dim=1)
-    return (torch.full(inner_product.size(), torch.pi/2) - torch.acos(inner_product.abs().clamp(0,1)))
+    return (torch.asin(inner_product.abs().clamp(0,1)))
+    # return (torch.full(inner_product.size(), torch.pi/2) - torch.acos(inner_product.abs().clamp(0,1)))
 
 def qcosine(bstates1, bstates2, eps=1e-9):
     norm1 = torch.linalg.vector_norm(bstates1, ord=2, dim=1)
@@ -52,7 +53,7 @@ def amplitude_encoding(vector):
     return state_vector
 
 def tn2qiskit(einsum_expr, gate_arr, param_dict={}, meas_output=True):
-    input_indices, _ = einsum_expr
+    input_indices, output_indices = einsum_expr
     nq = sum(1 for gate in gate_arr if gate['op_type'] == '0')
     qreg = QuantumRegister(nq, f"qc{randint(1,10000)}")
     creg = ClassicalRegister(nq, f"c{randint(1,10000)}")
@@ -68,7 +69,8 @@ def tn2qiskit(einsum_expr, gate_arr, param_dict={}, meas_output=True):
             wire2q[wire_name].append(qcounter)
             qcounter += 1
         elif gate['op_type'] == '0_dag':
-            wire2q[idx_arr[0]].pop()
+            q_target = wire2q[idx_arr[0]].pop()
+            qc.measure(q_target, q_target)
         else: 
             num_in = len(idx_arr) // 2 
             in_wires = idx_arr[:num_in]

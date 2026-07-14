@@ -33,12 +33,16 @@ class QuantumFeatureMap(nn.Module):
         self.init_params(id_init)
         self.global_pca_max = 1.0  # Placeholder for normalization during PCA projection
 
+    def get_device(self):
+        return next(self.parameters()).device
+
     def init_params(self, id_init=False):
+        num_params = len(self.sym2param)
         if id_init:
-            raw_tensor = torch.empty(len(self.sym2param),).uniform_(-0.01, 0.01)
+            param_data = [torch.randn(1) * 0.01 for _ in range(num_params)]
         else:
-            raw_tensor = torch.randn(len(self.sym2param),) * 2 * torch.pi
-        self.params = nn.Parameter(raw_tensor, requires_grad=True)
+            param_data = [torch.randn(1) * 2 * torch.pi for _ in range(num_params)]
+        self.params = nn.ParameterList([nn.Parameter(p, requires_grad=True) for p in param_data])
 
     def reset_char(self):
         self.char_idx = count(0)
@@ -115,7 +119,7 @@ class QuantumFeatureMap(nn.Module):
 
     def get_features(self, img_vecs):
         if self.method == 'mlp':
-            img_vecs = torch.as_tensor(img_vecs, dtype=torch.float32, device=self.params.device)
+            img_vecs = torch.as_tensor(img_vecs, dtype=torch.float32, device=self.get_device())
             features = self.projector(img_vecs.view(img_vecs.shape[0], -1)) * torch.pi
         if self.method == 'pca':
             if torch.is_tensor(img_vecs):
@@ -124,12 +128,11 @@ class QuantumFeatureMap(nn.Module):
                 flat_vector = np.asarray(img_vecs).reshape(len(img_vecs), -1)
             raw_pca = self.pca.transform(flat_vector)
             norm_pca = (raw_pca / (self.global_pca_max + 1e-8)) * np.pi
-            features = torch.tensor(norm_pca, dtype=torch.float32, device=self.params.device)
+            features = torch.tensor(norm_pca, dtype=torch.float32, device=self.get_device())
         return features 
     
     def encode_features(self, img_vec):
-        device = next(self.parameters()).device
-        img_vec = torch.as_tensor(img_vec, dtype=torch.float32, device=device)
+        img_vec = torch.as_tensor(img_vec, dtype=torch.float32, device=self.get_device())
         is_1d = (img_vec.ndim == 1)
         if is_1d: img_vec = img_vec.unsqueeze(0)
         features = self.get_features(img_vec)
@@ -153,13 +156,13 @@ class QuantumFeatureMap(nn.Module):
 
     def forward(self, img_vecs):
         features = self.get_features(img_vecs)
-        
+        thetas = torch.cat([p for p in self.params])
         tensor_arr = []
         axis_map = {'Rx': 0, 'Ry': 1, 'Rz': 2}
         for item in self.gate_arr:
             symbol, gate = item['name'], item['op_type']
             if gate == '0':
-                tensor_arr.append(torch.tensor([1, 0], dtype=torch.complex64, device=self.params.device))
+                tensor_arr.append(torch.tensor([1, 0], dtype=torch.complex64, device=self.get_device()))
                 continue
 
             parts = symbol.split('_')
@@ -178,9 +181,9 @@ class QuantumFeatureMap(nn.Module):
             elif param_type == 'img':
                 if gate == 'Ry':
                     idx = self.sym2param[symbol]
-                    tensor_arr.append(Ry(self.params[idx]))
+                    tensor_arr.append(Ry(thetas[idx]))
                 if gate == 'CRz':
                     idx = self.sym2param[symbol]
-                    tensor_arr.append(CRz(self.params[idx]))
+                    tensor_arr.append(CRz(thetas[idx]))
 
         return self.contraction_path(*tensor_arr)   

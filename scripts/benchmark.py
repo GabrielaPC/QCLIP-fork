@@ -10,17 +10,18 @@ from tqdm import tqdm
 # Local framework imports
 from factory import build_dataset, build_experiment
 from modules.models.fusion.engine import MMEvaluator
-from modules.utils.general import get_device, load_pkl
+from modules.utils.general import get_device, load_pkl, store_pkl
 from modules.data_pipeline.datasets import SwapDataset, swap_collate_fn
 from modules.utils.analysis import tn_metadata, analyse_einsum
+from modules.utils.general import gen_id
 
 def log_phase(name: str):
     print(f"\n[{name.upper()}] " + "—" * (60 - len(name)))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, required=True, help='Path to experiment config YAML')
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt file)")
+    parser.add_argument("-cfg", "--config", type=str, required=True, help='Path to experiment config YAML')
+    parser.add_argument("-cp", "--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt file)")
     args = parser.parse_args()
 
     logging.getLogger("alembic").setLevel(logging.WARNING)
@@ -82,12 +83,29 @@ if __name__ == "__main__":
 
     log_phase("Loading Model Checkpoint Weights")
     checkpoint = torch.load(checkpoint_path, map_location=DEV)
-    img_params = sum(p.numel() for p in checkpoint["image"].values() if hasattr(p, "numel"))
-    txt_params = sum(p.numel() for p in checkpoint["text"].values() if hasattr(p, "numel"))
-    print(f"    [Checkpoint Info] -> Image Params: {img_params:,} | Text Params: {txt_params:,}")
+    text_params = checkpoint["text"]
+    image_params = checkpoint["image"]
+    n_img_params = sum(p.numel() for p in image_params.values() if hasattr(p, "numel"))
+    n_txt_params = sum(p.numel() for p in text_params.values() if hasattr(p, "numel"))
+    print(f"    [Checkpoint Info] -> Image Params: {n_img_params:,} | Text Params: {n_txt_params:,}")
 
-    image_model.load_state_dict(checkpoint["image"])
-    text_model.load_state_dict(checkpoint["text"])
+    def upgrade_checkpoint(old_state_dict):
+        new_state_dict = {}
+        for key, value in old_state_dict.items():
+            if key == "params":
+                for i in range(value.size(0)):
+                    new_state_dict[f"params.{i}"] = value[i:i+1]
+            else:
+                new_state_dict[key] = value
+        return new_state_dict
+
+    if "params" in text_params and not any("params." in k for k in text_params):
+        text_params = upgrade_checkpoint(text_params)
+    if "params" in image_params and not any("params." in k for k in image_params):
+        image_params = upgrade_checkpoint(image_params)
+
+    text_model.load_state_dict(text_params, strict=False)
+    image_model.load_state_dict(image_params)
 
     saved_epoch = checkpoint.get("epoch", "N/A")
     saved_loss = checkpoint.get("train_loss", "N/A")
@@ -97,49 +115,52 @@ if __name__ == "__main__":
     image_model.eval()
     text_model.eval()
 
-    log_phase("Constructing Data Engine Context")
     if config['vision']['method'] == 'amp':
         img_transform = None
     else:
         img_transform = v2.Compose([v2.ToImage(),               
                                     v2.ToDtype(torch.float32, scale=True),
-                                    v2.Resize((64, 64))])
-        
+                                    v2.Resize((64, 64))])        
 
     log_phase("Compiling Evaluation Graph Structures")
-    if config["splits"].get("swap", None) is not None:
-        DatasetClass = SwapDataset
-        collate_fn = swap_collate_fn
-        split = config["splits"]["swap"]
-    else:
-        split = config["splits"]["test"]
-    df_eval = load_pkl(split["text_path"])
-    compiled_eval = ansatz.compile_dataset(df_eval, **compile_kwargs)
-    eval_loader = DataLoader(
-        DatasetClass(compiled_eval, split["img_path"], image_transform=img_transform),
-        batch_size=config["batch_size"], 
-        collate_fn=collate_fn, 
-        shuffle=False, 
-        num_workers=4, 
-        pin_memory=True
-    )
-    print(f" Evaluation DataLoader ready: {len(eval_loader)} steps | Batch Size: {config['batch_size']}")
-
-    log_phase("Executing Metrics Benchmark Suite")
+    test_sets = config["splits"]["test"]
     evaluator = MMEvaluator(image_model, text_model, DEV)
-    eval_fn = getattr(evaluator, config['test_task'], None)
-    metrics = {}
 
-    with torch.no_grad():
-        start_task = time.time()
-        task_metrics = eval_fn(eval_loader)
-        metrics.update(task_metrics)
-        elapsed = time.time() - start_task
-        print(f"    Completed in {elapsed:.2f}s")
+    all_results = {}
+    for split_name, split_info in test_sets.items():
+        if split_name == 'swap':
+            DatasetClass = SwapDataset
+            collate_fn = swap_collate_fn
+
+        df_eval = load_pkl(split_info["text_path"])
+        compiled_eval = ansatz.compile_dataset(df_eval, **compile_kwargs)
+        eval_loader = DataLoader(
+            DatasetClass(compiled_eval, split_info["img_path"], image_transform=img_transform),
+            batch_size=config["batch_size"], 
+            collate_fn=collate_fn, 
+            shuffle=False, 
+            num_workers=4, 
+            pin_memory=True
+        )
+        print(f" -> DataLoader ready for '{split_name}': {len(eval_loader)} steps")
+
+        eval_fn = getattr(evaluator, split_info['task'], None)
+
+        with torch.no_grad():
+            start_task = time.time()
+            task_metrics, task_deta = eval_fn(eval_loader)
+            elapsed = time.time() - start_task
+            print(f" -> Evaluated '{split_name}' task in {elapsed:.2f}s")
+            for key, val in task_metrics.items():
+                all_results[f"{split_name}_{key}"] = val
+            run_name = gen_id(config)
+            save_filename = f"results/{config['dataset']['name']}/{run_name}_{split_name}_margins.pkl"
+            os.makedirs(os.path.dirname(save_filename), exist_ok=True)
+            store_pkl(task_deta, save_filename)
 
     log_phase("Final Benchmark Scoreboard")
-    print(f" {'Metric Key':<35} | {'Value / Score':<15}")
-    print(" " + "—" * 53)
-    for key, val in metrics.items():
-        print(f"  {key:<34} | {val:.6f}")
-    print(" " + "—" * 53 + "\n")
+    print(f"{'Split & Metric Key':<35} | {'Value / Score':<15}")
+    print("—" * 53)
+    for key, val in all_results.items():
+        print(f"{key:<35} | {val:.6f}")
+    print("—" * 53 + "\n")

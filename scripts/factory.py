@@ -60,7 +60,7 @@ def build_experiment(config, device):
         if config['vision']['method'] == 'amp':
             image_model = FrozenCLIP(classical=False).to(device)
         else:
-            image_model = QuantumFeatureMap(k=config['embedding_qubits'], layers=config['vision']['layers'], batch_size=config['batch_size'], id_init=True, method=config['vision']['method']).to(device)
+            image_model = QuantumFeatureMap(k=config['embedding_qubits'], layers=config['vision']['layers'], batch_size=config['batch_size'], id_init=False, method=config['vision']['method']).to(device)
         text_model = VQCModel(out_q=config['embedding_qubits']).to(device)
         # text_model = torch.compile(text_model, mode="max-autotune")
         

@@ -15,7 +15,7 @@ from tqdm import tqdm
 # uv run python train.py --config configs/tensor_network.yaml
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, required=True, help='Path to experiment config YAML')
+    parser.add_argument('-cfg', "--config", type=str, required=True, help='Path to experiment config YAML')
     args = parser.parse_args()
 
     logging.getLogger("alembic").setLevel(logging.WARNING)
@@ -51,6 +51,7 @@ if __name__ == "__main__":
     compile_kwargs = {}
     if config['model_type'] == 'vqc':
         compile_kwargs["curry"] = config["text"].get("curry", False)
+        compile_kwargs["spider"] = config["text"].get("spider", False)
     compiled_train = ansatz.compile_dataset(df_train, **compile_kwargs)
     compiled_val = ansatz.compile_dataset(df_val, **compile_kwargs)
     print(f" Dataset footprints compiled: Train={len(compiled_train)} | Val={len(compiled_val)}")
@@ -63,7 +64,7 @@ if __name__ == "__main__":
         for col in cols:
             symbol_arr += compiled_train[col].tolist() + compiled_val[col].tolist()
         
-        sym_kwargs = {"id_init": True} if config["model_type"] == "vqc" else {}
+        sym_kwargs = {"id_init": False} if config["model_type"] == "vqc" else {}
         text_model.from_symbols(symbol_arr, **sym_kwargs)
         print(f" Text Model vocabulary locked: {len(text_model.symbols)} distinct symbols.")
 
@@ -112,7 +113,11 @@ if __name__ == "__main__":
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, collate_fn=collate_fn, shuffle=False, num_workers=4, pin_memory=True)
     print(f" Batched steps mapped: Train={len(train_loader)} steps | Val={len(val_loader)} steps")
 
-    optimizer = torch.optim.Adam(list(text_model.parameters()) + list(image_model.parameters()), lr=config['learning_rate'])
+
+    quantum_params = list(text_model.parameters()) + list(image_model.params)
+    classical_params = list(image_model.projector.parameters()) if config['vision']['method'] == 'mlp' else []
+    optimizer = torch.optim.Adam([{'params': quantum_params, 'lr': config['qlr']},
+                                   {'params': classical_params, 'lr': config['clr']}], betas=(0.9, 0.999), eps=1e-08, weight_decay=0)
     trainer = ContrastiveTrainer(image_model, text_model, optimizer, loss_fn, DEV)
     evaluator = MMEvaluator(image_model, text_model, DEV)
     print(" Gradient step managers and performance metrics trackers bound.")
@@ -122,7 +127,7 @@ if __name__ == "__main__":
     img_tower = type(image_model).__name__
     run_name = gen_id(config)
 
-    checkpoint_dir = Path(f"./checkpoints/{DATASET}/{txt_tower}_{img_tower}")
+    checkpoint_dir = Path(f"./checkpoints/{DATASET}/{config['model_type']}")
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint_path = checkpoint_dir / f"{run_name}.pt"
@@ -145,7 +150,8 @@ if __name__ == "__main__":
         mlflow.log_params({
             "epochs": config['epochs'],
             "batch_size": config['batch_size'],
-            "learning_rate": config['learning_rate'],
+            "learning_rate_quantum": config['qlr'],
+            "learning_rate_classical": config['clr'],
             "temperature_parameter": loss_fn.temperature,
             "device_target": str(DEV),
             "seed": SEED,
@@ -179,7 +185,7 @@ if __name__ == "__main__":
                     else:
                         task_metrics = eval_fn(val_loader, choice='image')
                 else:
-                    task_metrics = eval_fn(val_loader)
+                    task_metrics, _ = eval_fn(val_loader)
                 metrics.update(task_metrics)
             
             mlflow.log_metrics(metrics, step=epoch)
