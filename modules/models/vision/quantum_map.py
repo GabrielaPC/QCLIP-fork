@@ -51,6 +51,9 @@ class QuantumFeatureMap(nn.Module):
         i = next(self.char_idx)
         chars = "acdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
         return chars[i] if i < len(chars) else chr(192 + i - len(chars))
+    
+    def _get_params(self):
+        return {sym: float(self.params[idx].detach().cpu().item()) for sym, idx in self.sym2param.items()}
 
     def compile_fmap(self):
         self.reset_char()

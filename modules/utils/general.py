@@ -1,6 +1,7 @@
-import torch, pickle, gc, random
+import torch, pickle, gc, random, logging, yaml, os
 from datetime import datetime
 import numpy as np
+from pathlib import Path
 
 def get_device():
     if torch.backends.mps.is_available():
@@ -73,3 +74,45 @@ def gen_id(config):
     v_str = f"v_{serialise_subsapce(config['vision'])}"
     timestamp = datetime.now().strftime('%m%d_%H%M')
     return f"{t_str}__{v_str}__{timestamp}"
+
+def setup_exp(config_path: str):
+    logging.getLogger("alembic").setLevel(logging.WARNING)
+    logging.getLogger("mlflow").setLevel(logging.WARNING)
+
+    with open(config_path, 'r') as file:
+        config = yaml.safe_load(file)
+
+    device = get_device()
+    seed = config.get("seed", int.from_bytes(os.urandom(4), "big"))
+    set_seed(seed)
+    
+    return config, device, seed
+
+class CheckpointManager:
+    @staticmethod
+    def upgrade_checkpoint(old_state_dict):
+        new_state_dict = {}
+        for key, value in old_state_dict.items():
+            if key == "params":
+                for i in range(value.size(0)):
+                    new_state_dict[f"params.{i}"] = value[i:i+1]
+            else:
+                new_state_dict[key] = value
+        return new_state_dict
+
+    @classmethod
+    def load_model(cls, checkpoint_path: Path, image_model, text_model, device):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        text_params = checkpoint["text"]
+        image_params = checkpoint["image"]
+
+        if "params" in text_params and not any("params." in k for k in text_params):
+            text_params = cls.upgrade_checkpoint(text_params)
+        if "params" in image_params and not any("params." in k for k in image_params):
+            image_params = cls.upgrade_checkpoint(image_params)
+
+        text_model.load_state_dict(text_params, strict=False)
+        image_model.load_state_dict(image_params)
+        
+        return checkpoint

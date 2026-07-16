@@ -5,9 +5,11 @@ clr: 0.00001
 epochs: 100
 embedding_qubits: 9
 
-emulation_set: "swap"
-noise: false
-eps: 0.01
+emulate:
+  set: "swap"
+  noise: false
+  eps: 0.01
+  method: "statevector" # 'statevector', 'tensor_network', 'matrix_product_state', 'density_matrix'
 
 text:
   ansatz: "custom_v5"
@@ -32,46 +34,34 @@ vision:
 #     - "evaluate_text_choice"
 #     - "compositional_diagnostic"
 
-# splits:
-#   train:
-#     text_path: "data/aro/processed/train.pkl"
-#     img_path: "data/aro/processed/image_embeddings.pt"
-#   val:
-#     text_path: "data/aro/processed/val.pkl"
-#     img_path: "data/aro/processed/image_embeddings.pt"
-#   test:
-#     att:
-#       text_path: "data/aro/processed/test_att.pkl"
-#       img_path: "data/aro/processed/image_embeddings.pt"
-#       task: "evaluate_text_choice"
-#     rel:
-#       text_path: "data/aro/processed/test_rel.pkl"
-#       img_path: "data/aro/processed/image_embeddings.pt"
-#       task: "evaluate_text_choice"
-
 dataset:
   name: "svo-probes"
-  labels: ["caption", "pos_image", "neg_image"]
   class: "modules.data_pipeline.datasets.SVODataset"
   collate_fn: "modules.data_pipeline.datasets.svo_collate_fn"
   eval_mapper: "modules.models.fusion.engine.svo_mapper"
-  eval_tasks: 
-    - "evaluate_image_choice"
-    - "compositional_diagnostic"
 
-splits:
   train:
     text_path: "data/svo-probes/processed/train.pkl"
     img_path: "data/svo-probes/processed/image_embeddings.pt"
   val:
     text_path: "data/svo-probes/processed/val.pkl"
     img_path: "data/svo-probes/processed/image_embeddings.pt"
+    diagnostics:
+      - "evaluate_image_choice"
+      - "diagnostic_image_choice"
+
   test:
     std:
+      class: "modules.data_pipeline.datasets.SVODataset"
+      collate_fn: "modules.data_pipeline.datasets.svo_collate_fn"
+
       text_path: "data/svo-probes/processed/test.pkl"
       img_path: "data/svo-probes/processed/image_embeddings.pt"
       task: "evaluate_image_choice"
     swap:
+      class: "modules.data_pipeline.datasets.SwapDataset"
+      collate_fn: "modules.data_pipeline.datasets.swap_collate_fn"
+
       text_path: "data/svo-probes/processed/swap.pkl"
       img_path: "data/svo-probes/processed/image_embeddings.pt"
       task: "evaluate_text_choice"

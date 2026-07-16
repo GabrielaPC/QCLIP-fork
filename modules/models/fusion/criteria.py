@@ -72,6 +72,7 @@ class FS_InfoNCE(nn.Module):
 
         # Compute angular similarity matrix via Fubini-Study distance
         overlap = torch.clamp((text_emb @ image_emb.conj().t()).abs(), 0.0, 1.0 - self.eps)
+        overlap = 0.5 + (0.5 * overlap)  # Map to [0.5, 1] for stability
         logits = (torch.asin(overlap) / (math.pi / 2)) / self.temperature
 
         loss_txt = self.cross_entropy(logits, labels)

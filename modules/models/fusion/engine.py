@@ -1,10 +1,109 @@
-import torch
+import torch, yaml, mlflow, time, socket
 from typing import Callable
 import torch.nn.functional as F
+from modules.utils.general import gen_id, log_phase
+from pathlib import Path
+from tqdm import tqdm
 
 mscoco_mapper = lambda batch: (batch["image"], batch["caption"])
 aro_mapper = lambda batch: (batch["image"], batch["pos_caption"])
 svo_mapper = lambda batch: (batch["pos_image"], batch["caption"])
+
+
+class RunManager:
+    def __init__(self, config, trainer, evaluator, device, seed):
+        self.config = config
+        self.trainer = trainer
+        self.evaluator = evaluator
+        self.device = device
+        self.seed = seed
+
+        self.dataset_name = config['dataset']['name']
+        self.model_type = config['model_type']
+        self.run_name = gen_id(config)
+
+        self.checkpoint_dir = Path(f"./checkpoints/{self.dataset_name}/{self.model_type}/{self.run_name}")
+        self.checkpoint_path = self.checkpoint_dir / f"last.pt"
+        self.best_checkpoint_path = self.checkpoint_dir / f"best.pt"
+
+        self.eval_tasks = config['dataset']['val'].get('diagnostics', ['global_retrieval'])
+
+    def _setup_environment(self):
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        with open(self.checkpoint_dir / f"config.yaml", 'w') as f:
+            yaml.dump(self.config, f, default_flow_style=False, sort_keys=False)
+
+        mlf_db_path = Path.cwd() / f"mlf_dbs/{self.dataset_name}.db"
+        mlf_db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        mlflow.pytorch.autolog(log_models=False)
+        mlflow.set_tracking_uri(f"sqlite:///{mlf_db_path}")
+        mlflow.set_experiment(self.dataset_name)
+
+    def _save_checkpoint(self, epoch, loss, metrics, is_best=False):
+        payload = {
+            "image": self.image_model.state_dict(),
+            "text": self.text_model.state_dict(),
+            "epoch": epoch,
+            "train_loss": loss,
+            "val_metrics": metrics
+        }
+        torch.save(payload, self.checkpoint_path)
+        if is_best:
+            torch.save(payload, self.best_checkpoint_path)
+
+    def fit(self, train_loader, val_loader, eval_mapper):
+        self._setup_environment()
+        
+        hostname = socket.gethostname()
+        
+        log_phase(f"Model #{self.run_name}: optimization started on \"{hostname}\"...")
+        
+        best_metric_value = float("-inf")
+        target_metric = "i2tR1" if 'global_retrieval' in self.eval_tasks else 'hard_neg_acc'
+
+        with mlflow.start_run(run_name=self.run_name):
+            mlflow.log_params({
+                "epochs": self.config['epochs'],
+                "batch_size": self.config['batch_size'],
+                "learning_rate_quantum": self.config['qlr'],
+                "learning_rate_classical": self.config['clr'],
+                "temperature_parameter": self.trainer.loss_fn.temperature,
+                "device_target": str(self.dev),
+                "seed": self.seed,
+                "text_tower": type(self.text_model).__name__,
+                "image_tower": type(self.image_model).__name__,
+                "execution_host": hostname,
+                "model_path": str(self.checkpoint_path),
+            })
+
+            epoch_pbar = tqdm(range(self.config['epochs']), desc="Training Pipeline", unit="epoch")
+            
+            for epoch in epoch_pbar:
+                start_time = time.time()
+                loss = self.trainer.train_epoch(train_loader, eval_mapper)
+                elapsed_time = time.time() - start_time
+
+                metrics = self.evaluator.eval_set(
+                    dataloader=val_loader,
+                    tasks=self.eval_tasks,
+                    eval_mapper=eval_mapper,
+                    dataset_name=self.dataset_name
+                )
+
+                mlflow.log_metrics(metrics, step=epoch)
+                metrics_str = " | ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
+                tqdm.write(f" Epoch {epoch:02d} | Loss: {loss:.4f} | {metrics_str} | Time: {elapsed_time:.1f}s")
+
+                current_metric = metrics.get(target_metric, 0.0)
+                is_best = current_metric > best_metric_value
+                if is_best:
+                    best_metric_value = current_metric
+
+                self._save_checkpoint(epoch, loss, metrics, is_best=is_best)
+                
+        log_phase("Experiment Run Concluded")
 
 class ContrastiveTrainer:
     def __init__(self, image_model, text_model, optimizer, loss_fn, device):
@@ -29,14 +128,6 @@ class ContrastiveTrainer:
             loss = self.loss_fn(text_emb, image_emb)
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
-
-            # DIAGNOSTICS
-            # text_grads = [p.grad.norm().item() for p in self.text_model.parameters() if p.grad is not None]
-            # image_grads = [p.grad.norm().item() for p in self.image_model.parameters() if p.grad is not None]
-            # print(f"Active Text Param Groups: {len(text_grads)} | Mean Grad Norm: {sum(text_grads)/len(text_grads) if text_grads else 0}")
-            # print(f"Active Image Param Groups: {len(image_grads)} | Mean Grad Norm: {sum(image_grads)/len(image_grads) if image_grads else 0}")
-            # print(f"Text Emb Norm Mean: {text_emb.norm(dim=-1).mean().item():.4f}")
-            # print(f"Image Emb Norm Mean: {image_emb.norm(dim=-1).mean().item():.4f}")
 
             # torch.nn.utils.clip_grad_norm_(self.text_model.parameters(), max_norm=1.0)
             self.optimizer.step()
@@ -142,7 +233,7 @@ class MMEvaluator:
         return metrics
     
     @torch.no_grad()
-    def evaluate_text_choice(self, dataloader) -> float:
+    def hard_neg_eval(self, dataloader, choice = 'text') -> dict:
         self.image_model.eval()
         self.text_model.eval()
         correct_final = total = 0
@@ -150,12 +241,17 @@ class MMEvaluator:
         pos_arr, neg_arr = [], []
         correct_arr, margin_arr = [], []
         for batch in dataloader:
-            img_emb = self._encode_img(batch["image"])
-            pos_txt_emb = self._encode_txt(batch["pos_caption"])
-            neg_txt_emb = self._encode_txt(batch["neg_caption"])
-            
-            pos_sim = torch.sum(img_emb.conj() * pos_txt_emb, dim=1).abs()
-            neg_sim = torch.sum(img_emb.conj() * neg_txt_emb, dim=1).abs()
+            if choice == 'text':
+                m1_emb = self._encode_img(batch["image"])
+                pos_m2_emb = self._encode_txt(batch["pos_caption"])
+                neg_m2_emb = self._encode_txt(batch["neg_caption"])
+            if choice == 'image':
+                m1_emb = self._encode_txt(batch["caption"])
+                pos_m2_emb = self._encode_img(batch["pos_image"])
+                neg_m2_emb = self._encode_img(batch["neg_image"])
+
+            pos_sim = torch.sum(m1_emb.conj() * pos_m2_emb, dim=1).abs()
+            neg_sim = torch.sum(m1_emb.conj() * neg_m2_emb, dim=1).abs()
             pos_arr.extend(pos_sim.cpu().numpy())
             neg_arr.extend(neg_sim.cpu().numpy())
             
@@ -165,35 +261,14 @@ class MMEvaluator:
             margin_arr.extend(margin.cpu().numpy())
             correct_arr.extend(correct.cpu().numpy())
 
-            total += img_emb.size(0)
-        return {"acc": correct_final / total}, {"pos_scores": pos_arr, "neg_scores": neg_arr, "margins": margin_arr, "correct": correct_arr}
-
-    @torch.no_grad()
-    def evaluate_image_choice(self, dataloader) -> float:
-        self.image_model.eval()
-        self.text_model.eval()
-        correct_final = total = 0
-
-        pos_arr, neg_arr = [], []
-        correct_arr, margin_arr = [], []
-        for batch in dataloader:
-            txt_emb = self._encode_txt(batch["caption"])
-            pos_img_emb = self._encode_img(batch["pos_image"])
-            neg_img_emb = self._encode_img(batch["neg_image"])
+            total += m1_emb.size(0)
+        return {"hard_neg_acc": correct_final / total}, {"pos_scores": pos_arr, "neg_scores": neg_arr, "margins": margin_arr, "correct": correct_arr}
             
-            pos_sim = torch.sum(txt_emb.conj() * pos_img_emb, dim=1).abs()
-            neg_sim = torch.sum(txt_emb.conj() * neg_img_emb, dim=1).abs()
-            pos_arr.extend(pos_sim.cpu().numpy())
-            neg_arr.extend(neg_sim.cpu().numpy())
-            
-            margin = pos_sim - neg_sim
-            correct = (margin > 0).float()
-            correct_final += correct.sum().item()
-            margin_arr.extend(margin.cpu().numpy())
-            correct_arr.extend(correct.cpu().numpy())
+    def evaluate_text_choice(self, dataloader) -> dict:
+        return self.hard_neg_eval(dataloader, choice='text')
 
-            total += txt_emb.size(0)
-        return {"acc": correct_final / total}, {"pos_scores": pos_arr, "neg_scores": neg_arr, "margins": margin_arr, "correct": correct_arr}
+    def evaluate_image_choice(self, dataloader) -> dict:
+        return self.hard_neg_eval(dataloader, choice='image')
 
     @torch.no_grad()
     def evaluate_sugarcrepe_pp(self, dataloader: torch.utils.data.DataLoader) -> float:
@@ -238,7 +313,7 @@ class MMEvaluator:
         return {"txt_score": text_corr/total, "img_score": img_corr/total, "grp_score": group_corr/total}
     
     @torch.no_grad()
-    def compositional_diagnostic(self, dataloader, choice="text") -> dict:
+    def diagnostic(self, dataloader, choice="text") -> dict:
         self.image_model.eval()
         self.text_model.eval()
 
@@ -278,3 +353,30 @@ class MMEvaluator:
             "diag_mean_neg_overlap": sum_neg_sim / total_samples,
             "diag_collapse_gap": sum_absolute_gap / total_samples
         }
+    
+    def diagnostic_text_choice(self, dataloader) -> dict:
+        return self.diagnostic(dataloader, choice="text")
+    
+    def diagnostic_image_choice(self, dataloader) -> dict:
+        return self.diagnostic(dataloader, choice="image")
+    
+    @torch.no_grad()
+    def eval_set(self, dataloader, tasks, eval_mapper) -> dict:
+        self.image_model.eval()
+        self.text_model.eval()
+        metrics = {}
+        for task_name in tasks:
+            eval_fn = getattr(self, task_name, None)
+            if eval_fn is None:
+                print(f"Warning: Evaluation method '{task_name}' not found on MMEvaluator. Skipping.")
+                continue
+
+            if task_name == "global_retrieval":
+                task_metrics = eval_fn(dataloader, eval_mapper)
+            else:
+                out = eval_fn(dataloader)
+                task_metrics = out[0] if isinstance(out, tuple) else out
+                
+            metrics.update(task_metrics)
+            
+        return metrics
