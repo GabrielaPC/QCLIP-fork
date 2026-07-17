@@ -1,21 +1,11 @@
-import argparse, sys, torch
+import argparse
 from pathlib import Path
 import pandas as pd
-
-from modules.utils.factory import  build_experiment
 
 from modules.utils.factory import build_experiment
 from modules.utils.general import log_phase, setup_exp, CheckpointManager
 from modules.data_pipeline.engine import DataEngine
 from modules.compilation.quantum.emul import BackendManager, Emulator
-
-
-# Framework path setup
-ROOT_PATH = Path.cwd()
-sys.path.insert(0, str(ROOT_PATH))
-
-def circ_acc(pos_f, neg_f):
-    return (torch.sum((pos_f > neg_f)) / len(pos_f)).item()
 
 def main():
     parser = argparse.ArgumentParser()
