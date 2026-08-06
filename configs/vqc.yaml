@@ -24,16 +24,6 @@ vision:
   layers: 4
   method: 'mlp' # 'amp' or 'pca' or 'mlp'
 
-# dataset:
-#   name: "aro"
-#   labels: ["image", "pos_caption", "neg_caption"]
-#   class: "modules.data_pipeline.datasets.ARODataset"
-#   collate_fn: "modules.data_pipeline.datasets.aro_collate_fn"
-#   eval_mapper: "modules.models.fusion.engine.aro_mapper"
-#   eval_tasks: 
-#     - "evaluate_text_choice"
-#     - "compositional_diagnostic"
-
 dataset:
   name: "svo-probes"
   class: "modules.data_pipeline.datasets.SVODataset"
@@ -64,4 +54,35 @@ dataset:
 
       text_path: "data/svo-probes/processed/swap.pkl"
       img_path: "data/svo-probes/processed/image_embeddings.pt"
+      task: "evaluate_text_choice"
+
+dataset:
+  name: "aro"
+  class: "modules.data_pipeline.datasets.ARODataset"
+  collate_fn: "modules.data_pipeline.datasets.aro_collate_fn"
+  eval_mapper: "modules.models.fusion.engine.aro_mapper"
+
+  train:
+    text_path: "data/aro/processed/train.pkl"
+    img_path: "data/aro/processed/image_embeddings.pt"
+  val:
+    text_path: "data/aro/processed/val.pkl"
+    img_path: "data/aro/processed/image_embeddings.pt"
+    diagnostics:
+      - "evaluate_text_choice"
+      - "diagnostic_text_choice"
+  test:
+    att:
+      class: "modules.data_pipeline.datasets.ARODataset"
+      collate_fn: "modules.data_pipeline.datasets.aro_collate_fn"
+
+      text_path: "data/aro/processed/test_att.pkl"
+      img_path: "data/aro/processed/image_embeddings.pt"
+      task: "evaluate_text_choice"
+    rel:
+      class: "modules.data_pipeline.datasets.ARODataset"
+      collate_fn: "modules.data_pipeline.datasets.aro_collate_fn"
+
+      text_path: "data/aro/processed/test_rel.pkl"
+      img_path: "data/aro/processed/image_embeddings.pt"
       task: "evaluate_text_choice"

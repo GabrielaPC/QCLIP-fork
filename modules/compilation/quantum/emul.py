@@ -17,8 +17,9 @@ from modules.utils.general import store_pkl
 class BackendManager:
     def __init__(self, config, qlimit=None, hardware_profile=FakeMiami()):
         self.config = config
+        self.amplitude_encode = True if config['vision']['method'] == 'amp' else False
         self.qlimit = qlimit
-        self.backend = None
+        self._backend = None
         self.coupling_map = None
         self.basis_gates = None
         self.hardware_profile = hardware_profile
@@ -68,18 +69,17 @@ class BackendManager:
 
         print(f" Simulation: Profile {self.hardware_profile.name} ({self.qlimit} qubits), Device {qdev}, Method {method}, Noise {'Enabled' if self.config.get('noise') else 'Disabled'}")
         
-        self.backend = AerSimulator(method=method, device=qdev, cuStateVec_enable=True) 
-        self.backend.set_options(**backend_options)
+        self._backend = AerSimulator(method=method, device=qdev, cuStateVec_enable=True) 
+        self._backend.set_options(**backend_options)
 
     @property
     def backend(self):
-        return self.backend
+        return self._backend
 
     @property
     def get_physical_circuit(self):
         return self.basis_gates, self.coupling_map
     
-    @staticmethod
     def transpile(self, circuits, batch_size=128, optimization_level=1):
         transpiled_circs = []
         chunks = [circuits[i:i + batch_size] for i in range(0, len(circuits), batch_size)]
@@ -95,10 +95,11 @@ class BackendManager:
             transpiled_circs.extend(transpiled_chunk)
         return transpiled_circs
     
-    @staticmethod
-    def compile_circuits(self, compiled_df, txt_params, img_params):
-        dataset = self.data_engine.get_dataset(compiled_df, self.emulation_set)
-        data_size = min(self.limit, len(dataset)) if self.limit else len(dataset)
+    def compile_circuits(self, dataset, text_model, image_model, limit=None):
+        data_size = min(limit, len(dataset)) if limit else len(dataset)
+        print(f" Compiling {data_size} circuit pairs from dataset with {len(dataset)} samples.")
+        txt_params = text_model._get_params()
+        img_params = image_model._get_params() 
 
         raw_pos_circs, raw_neg_circs = [], []
         pos_metadata, neg_metadata = [], []
@@ -109,8 +110,8 @@ class BackendManager:
             try:
                 sample = dataset[idx]
                 image = sample["image"]
-                pos_einsum, pos_wires = sample["pos_caption"][0], sample["pos_caption"][1]
-                neg_einsum, neg_wires = sample["neg_caption"][0], sample["neg_caption"][1]
+                pos_einsum, pos_wires = sample["pos_caption"]
+                neg_einsum, neg_wires = sample["neg_caption"]
 
                 qc_pos_txt, pos_out_q, pos_txt_p = tn2qiskit(
                     einsum2interleaved(pos_einsum), pos_wires, txt_params, False
@@ -123,18 +124,19 @@ class BackendManager:
                     failed_circuits += 1
                     continue
 
-                if self.use_ansatz:
-                    img_vars = img_params | self.image_model.encode_features(image)
-                    in_idx, out_idx = einsum2interleaved(self.image_model.einsum_expr.replace('b', ''))
-                    qc_img, _, img_p = tn2qiskit([in_idx, out_idx], self.image_model.gate_arr, img_vars, False)
-                    pos_params = pos_txt_p | img_p
-                    neg_params = neg_txt_p | img_p
-                else:
+                if self.amplitude_encode:
                     img_vec = image if isinstance(image, np.ndarray) else image.detach().cpu().numpy()
                     normed_img_vec = amplitude_encoding(img_vec)
                     qc_img = QuantumCircuit(int(math.ceil(math.log2(len(normed_img_vec)))), 0)
                     qc_img.initialize(normed_img_vec)
                     pos_params, neg_params = pos_txt_p, neg_txt_p
+                else:
+                    img_vars = img_params | image_model.encode_features(image)
+                    in_idx, out_idx = einsum2interleaved(image_model.einsum_expr.replace('b', ''))
+                    qc_img, _, img_p = tn2qiskit([in_idx, out_idx], image_model.gate_arr, img_vars, False)
+                    pos_params = pos_txt_p | img_p
+                    neg_params = neg_txt_p | img_p
+
 
                 pos_params = {k: float(v.item()) if hasattr(v, 'item') else float(v) for k, v in pos_params.items()}
                 neg_params = {k: float(v.item()) if hasattr(v, 'item') else float(v) for k, v in neg_params.items()}
@@ -158,7 +160,10 @@ class BackendManager:
                 pos_param_maps.append(pos_params)
                 neg_param_maps.append(neg_params)
                 
-            except Exception:
+            except Exception as e:
+                if isinstance(e, KeyError):
+                    print(f"\n[DEBUG] KeyError on index {idx}. Available keys in sample: {list(sample.keys())}")
+                print(f" Error compiling circuit pair at index {idx}: {e}")
                 failed_circuits += 1
         
         print(f" Compiled {len(raw_pos_circs)} circuit pairs | Dropped {failed_circuits} samples.")
@@ -181,7 +186,6 @@ class Emulator:
         self.backend = backend
         self.shots = 64
 
-    @staticmethod
     def shot_estimation(self, nq_out, nq_ps, epsilon=0.01):    
         req_shots = 0.25 / (epsilon ** 2)
         raw_shots = req_shots * (2 ** nq_ps)
@@ -190,7 +194,6 @@ class Emulator:
         final_shots = int(math.ceil(final_shots))
         self.shots = max(4096, min(final_shots, 1_000_000))
 
-    @staticmethod
     def run_circuit(self, qc_array, shots=None, batch_size=24):
         shots = shots if shots is not None else self.shots
         result_array = []

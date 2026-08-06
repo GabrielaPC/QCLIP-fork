@@ -4,7 +4,7 @@ from modules.compilation.quantum import ansatz
 from modules.utils.general import load_pkl
 from modules.utils.analysis import tn_metadata, analyse_einsum
 from torchvision.transforms import v2
-from modules.utils.factory import build_dataset
+from modules.utils.factory import build_dataset, load_obj
 
 class DataEngine:
     def __init__(self, config, ansatz, device):
@@ -93,7 +93,10 @@ class DataEngine:
                 mode=split
             )
         elif split not in ['train', 'val']:
-            return self.DatasetClass(
+            BenchDatasetClass = load_obj(self.config['dataset']['test'][split].get('class', None))
+            if BenchDatasetClass is None:
+                raise ValueError(f"No dataset class specified for test split '{split}' in config.")
+            return BenchDatasetClass(
                 compiled_data, 
                 self.config['dataset']['test'][split]['img_path'], 
                 image_transform=self.img_transform, 
@@ -116,10 +119,11 @@ class DataEngine:
             return loader
         elif split not in ['train', 'val']:
             dataset = self.get_dataset(compiled_data, split=split)
+            collate_fn = load_obj(self.config['dataset']['test'][split]['collate_fn'])
             loader = DataLoader(
                 dataset, 
                 batch_size=self.config['batch_size'], 
-                collate_fn=self.collate_fn, 
+                collate_fn=collate_fn, 
                 shuffle=False, 
                 num_workers=4, 
                 pin_memory=True

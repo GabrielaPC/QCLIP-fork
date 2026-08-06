@@ -43,8 +43,8 @@ class RunManager:
 
     def _save_checkpoint(self, epoch, loss, metrics, is_best=False):
         payload = {
-            "image": self.image_model.state_dict(),
-            "text": self.text_model.state_dict(),
+            "image": self.trainer.image_model.state_dict(),
+            "text": self.trainer.text_model.state_dict(),
             "epoch": epoch,
             "train_loss": loss,
             "val_metrics": metrics
@@ -70,10 +70,10 @@ class RunManager:
                 "learning_rate_quantum": self.config['qlr'],
                 "learning_rate_classical": self.config['clr'],
                 "temperature_parameter": self.trainer.loss_fn.temperature,
-                "device_target": str(self.dev),
+                "device_target": str(self.device),
                 "seed": self.seed,
-                "text_tower": type(self.text_model).__name__,
-                "image_tower": type(self.image_model).__name__,
+                "text_tower": type(self.trainer.text_model).__name__,
+                "image_tower": type(self.trainer.image_model).__name__,
                 "execution_host": hostname,
                 "model_path": str(self.checkpoint_path),
             })
@@ -88,8 +88,7 @@ class RunManager:
                 metrics = self.evaluator.eval_set(
                     dataloader=val_loader,
                     tasks=self.eval_tasks,
-                    eval_mapper=eval_mapper,
-                    dataset_name=self.dataset_name
+                    eval_mapper=eval_mapper
                 )
 
                 mlflow.log_metrics(metrics, step=epoch)

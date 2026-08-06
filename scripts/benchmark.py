@@ -32,7 +32,7 @@ if __name__ == "__main__":
     data_engine.image_init(image_model)
 
     log_phase("Loading Model Checkpoint Weights")
-    checkpoint = CheckpointManager.load_model_weights(checkpoint_path, image_model, text_model, DEV)
+    checkpoint = CheckpointManager.load_model(checkpoint_path, image_model, text_model, DEV)
     print(f" Recovered from Epoch: {checkpoint.get('epoch', 'N/A')} | Historical Loss: {checkpoint.get('train_loss', 'N/A')}")
 
     image_model.eval()
@@ -40,7 +40,7 @@ if __name__ == "__main__":
     evaluator = MMEvaluator(image_model, text_model, DEV)
 
     log_phase("Compiling Evaluation Graph Structures")
-    test_sets = config["splits"]["test"]
+    test_sets = config["dataset"]["test"]
     results = {}
     for split_name, split_info in test_sets.items():
         compiled_eval = data_engine.compile_text(split_name)
@@ -50,7 +50,8 @@ if __name__ == "__main__":
 
         with torch.no_grad():
             start_task = time.time()
-            task_metrics = eval_fn(eval_loader)
+            out = eval_fn(eval_loader)
+            task_metrics = out[0] if isinstance(out, tuple) else out
             elapsed = time.time() - start_task
             print(f" -> Evaluated '{split_name}' task in {elapsed:.2f}s")
             for key, val in task_metrics.items(): results[f"{split_name}_{key}"] = val

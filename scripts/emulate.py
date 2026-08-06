@@ -10,15 +10,14 @@ from modules.compilation.quantum.emul import BackendManager, Emulator
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-cfg', '--config', type=str, required=True, help='Path to experiment config YAML')
-    parser.add_argument('-cp',"--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt file)")
+    parser.add_argument('-cp',"--checkpoint", type=str, default=None, help="Path to model checkpoint (.pt file)")
     parser.add_argument('-l', "--limit", type=int, default=None, help="Debug Flag: Truncate execution to top N samples")
     args = parser.parse_args()
 
     config, DEV, _ = setup_exp(args.config)
-    checkpoint_path = Path(args.checkpoint)
 
     log_phase("Evaluation Environment")
-    print(f" Target Device   : {DEV} | Weights : {checkpoint_path.name}")
+    print(f" Target Device   : {DEV} | Weights : ")
 
     log_phase("Instantiating Architecture")
     ansatz, image_model, text_model, _ = build_experiment(config, DEV)
@@ -26,34 +25,35 @@ def main():
     data_engine = DataEngine(config, ansatz, DEV)
     compiled_train = data_engine.compile_text('train')
     compiled_val = data_engine.compile_text('val')
-    emulation_set = config['emulation']['set']
+    emulation_set = config['emulate']['set']
     compiled_eval = data_engine.compile_text(emulation_set)
     einsum_data = data_engine.describe_einsum(text_model, compiled_eval, return_metrics=True)
-    qlimit = einsum_data['avg'][0] if config['dataset']['name'] == 'aro' else einsum_data['max'][0]
+    qlimit = (einsum_data['max'][0] + einsum_data['avg'][0]) // 2
 
     log_phase("Restoring Dynamic Parameter Spaces")
     data_engine.text_init(text_model, pd.concat([compiled_train, compiled_val], ignore_index=True))
     data_engine.image_init(image_model)
 
     log_phase("Loading Model Checkpoint Weights")
-    checkpoint = CheckpointManager.load_model_weights(checkpoint_path, image_model, text_model, DEV)
-    print(f" Recovered from Epoch: {checkpoint.get('epoch', 'N/A')} | Historical Loss: {checkpoint.get('train_loss', 'N/A')}")
+    if args.checkpoint is not None:
+        checkpoint_path = Path(args.checkpoint)
+        checkpoint = CheckpointManager.load_model_weights(checkpoint_path, image_model, text_model, DEV)
+        print(f" Recovered from ({checkpoint_path.name}) Epoch: {checkpoint.get('epoch', 'N/A')} | Historical Loss: {checkpoint.get('train_loss', 'N/A')}")
 
     image_model.eval()
     text_model.eval()
-    backend_manager = BackendManager(config, DEV, qlimit)
+    backend_manager = BackendManager(config, qlimit)
 
     log_phase("Extracting Parameter Angle Maps")
-    txt_params_dict = text_model._get_params()
-    img_params_dict = image_model._get_params() 
-    pos_circs, neg_circs = backend_manager.compile_circuits(compiled_val, txt_params_dict, img_params_dict)
+    eval_dataset = data_engine.get_dataset(compiled_eval, emulation_set)
+    pos_circs, neg_circs = backend_manager.compile_circuits(eval_dataset, text_model, image_model, args.limit)
 
     # 8. Execution and metric compiling
     log_phase("Executing Emulator Engine Pipeline")
-    emulator = Emulator(config, DEV, qlimit)
+    emulator = Emulator(config, backend_manager.backend)
     max_nq = max(qc.num_qubits for qc in pos_circs + neg_circs)
     nq_out = config['embedding_qubits']
-    emulator.shot_estimation(nq_out, max_nq - nq_out, epsilon=config['eps'])
+    emulator.shot_estimation(nq_out, max_nq - nq_out, epsilon=config['emulate']['eps'])
     print(f" Simulating quantum states across {len(pos_circs)} pairs with {emulator.shots} shot resolution")
     data = emulator.run_experiment(pos_circs, neg_circs, batch_size=64)
     acc = sum(data['correct']) / len(data['correct'])
