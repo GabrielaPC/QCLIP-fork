@@ -1,23 +1,25 @@
-import math
+import math, time, torch, mlflow, tempfile, pickle
 import numpy as np
-import time
-import torch
-import os
+from pathlib import Path
 from tqdm import tqdm
+
 from qiskit import transpile, QuantumCircuit
 from qiskit_aer import AerSimulator
 from qiskit_aer.noise import NoiseModel
 from qiskit_ibm_runtime.fake_provider import FakeMiami
 from qiskit.transpiler import CouplingMap
+
 from modules.utils.tensor_ops import einsum2interleaved
 from modules.utils.quantum_ops import tn2qiskit, amplitude_encoding
-from modules.utils.general import gen_id
-from modules.utils.general import store_pkl
+from modules.utils.general import gen_id, store_pkl
 
 class BackendManager:
     def __init__(self, config, qlimit=None, hardware_profile=FakeMiami()):
         self.config = config
         self.amplitude_encode = True if config['vision']['method'] == 'amp' else False
+        self.discard = self.config.get('emulate', {}).get('discard', False)
+        self.meas_method = self.config.get('emulate', {}).get('measurement_method', 'compute_uncompute')
+        self.nshadows = 0
         self.qlimit = qlimit
         self._backend = None
         self.coupling_map = None
@@ -28,7 +30,7 @@ class BackendManager:
     def _setup_backend(self):
         devices = AerSimulator().available_devices()
         qdev = 'GPU' if 'GPU' in devices else 'CPU'
-        method = self.config['emulate'].get('method', 'statevector')
+        method = self.config['emulate'].get('backend', 'statevector')
         
         backend_options = {
             "device": qdev,
@@ -40,16 +42,15 @@ class BackendManager:
             "fusion_enable": True,
             "fusion_threshold": 2,
             "fusion_max_qubit": 6,
+            # cuStateVec_enable=True
         }
 
         edges = self.hardware_profile.coupling_map.get_edges()
-        
         if self.qlimit is not None:
             filtered_edges = [edge for edge in edges if edge[0] < self.qlimit and edge[1] < self.qlimit]
             self.coupling_map = CouplingMap(filtered_edges)
         else:
             self.coupling_map = self.hardware_profile.coupling_map
-
         self.basis_gates = self.hardware_profile.basis_gates
 
         if self.config.get('noise'):
@@ -68,7 +69,6 @@ class BackendManager:
                 backend_options["max_parallel_shots"] = 256
 
         print(f" Simulation: Profile {self.hardware_profile.name} ({self.qlimit} qubits), Device {qdev}, Method {method}, Noise {'Enabled' if self.config.get('noise') else 'Disabled'}")
-        
         self._backend = AerSimulator(method=method, device=qdev, cuStateVec_enable=True) 
         self._backend.set_options(**backend_options)
 
@@ -98,6 +98,7 @@ class BackendManager:
     def compile_circuits(self, dataset, text_model, image_model, limit=None):
         data_size = min(limit, len(dataset)) if limit else len(dataset)
         print(f" Compiling {data_size} circuit pairs from dataset with {len(dataset)} samples.")
+
         txt_params = text_model._get_params()
         img_params = image_model._get_params() 
 
@@ -140,23 +141,22 @@ class BackendManager:
 
                 pos_params = {k: float(v.item()) if hasattr(v, 'item') else float(v) for k, v in pos_params.items()}
                 neg_params = {k: float(v.item()) if hasattr(v, 'item') else float(v) for k, v in neg_params.items()}
-                qc_img_inv = qc_img.inverse()
 
                 # Assemble frames
-                qc_pos = QuantumCircuit(qc_pos_txt.num_qubits, qc_pos_txt.num_clbits)
-                qc_pos.compose(qc_pos_txt, inplace=True)
-                qc_pos.compose(qc_img_inv, qubits=pos_out_q, inplace=True)
-                qc_pos.measure(pos_out_q, pos_out_q)
+                if self.meas_method == 'compute_uncompute':
+                    qc_pos = self._compute_uncompute(qc_pos_txt, qc_img, pos_out_q)
+                    qc_neg = self._compute_uncompute(qc_neg_txt, qc_img, neg_out_q)
+                elif self.meas_method == 'destructive_swap':
+                    qc_pos = self._destructive_swap(qc_pos_txt, qc_img, pos_out_q)
+                    qc_neg = self._destructive_swap(qc_neg_txt, qc_img, neg_out_q)
+                elif self.meas_method == 'classical_shadows':
+                    qc_pos = self._classical_shadows(qc_pos_txt, qc_img, pos_out_q)
+                    qc_neg = self._classical_shadows(qc_neg_txt, qc_img, neg_out_q)
 
-                qc_neg = QuantumCircuit(qc_neg_txt.num_qubits, qc_neg_txt.num_clbits)
-                qc_neg.compose(qc_neg_txt, inplace=True)
-                qc_neg.compose(qc_img_inv, qubits=neg_out_q, inplace=True)
-                qc_neg.measure(neg_out_q, neg_out_q)
-
-                raw_pos_circs.append(qc_pos)
-                raw_neg_circs.append(qc_neg)
                 pos_metadata.append({"output_qubits": pos_out_q})
                 neg_metadata.append({"output_qubits": neg_out_q})
+                raw_pos_circs.append(qc_pos)
+                raw_neg_circs.append(qc_neg)
                 pos_param_maps.append(pos_params)
                 neg_param_maps.append(neg_params)
                 
@@ -179,81 +179,290 @@ class BackendManager:
             neg_circs[i].assign_parameters(neg_param_maps[i], inplace=True)
 
         return pos_circs, neg_circs
+    
+
+    def _strip_clbits(self, qc):
+        if qc.num_clbits == 0:
+            return qc
+        clean_qc = QuantumCircuit(qc.num_qubits)
+        for instr in qc.data:
+            if instr.operation.name != 'measure':
+                qargs = [qc.find_bit(q).index for q in instr.qubits]
+                clean_qc.append(instr.operation, qargs)
+        return clean_qc
+
+    def _compute_uncompute(self, qc_txt, qc_img, out_q):
+        qc_txt = self._strip_clbits(qc_txt)
+        qc_img = self._strip_clbits(qc_img)
+
+        n_txt = qc_txt.num_qubits
+        n_out = len(out_q)
+
+        if self.discard:
+            qc = QuantumCircuit(n_txt, n_out)
+            qc.compose(qc_txt, inplace=True)
+            qc.compose(qc_img.inverse(), qubits=out_q[::-1], inplace=True)
+            qc.measure(out_q, range(n_out))
+        else:
+            qc = QuantumCircuit(n_txt, n_txt)
+            qc.compose(qc_txt, inplace=True)
+            qc.compose(qc_img.inverse(), qubits=out_q[::-1], inplace=True)
+            qc.measure(range(n_txt), range(n_txt))
+        return qc
+    
+    def _destructive_swap(self, qc_txt, qc_img, out_q):
+        qc_txt = self._strip_clbits(qc_txt)
+        qc_img = self._strip_clbits(qc_img)
+
+        n_out = len(out_q)
+        n_txt = qc_txt.num_qubits
+        n_total = n_txt + n_out
+
+        qc = QuantumCircuit(n_total, 2 * n_out if self.discard else n_total)
+        qc.compose(qc_txt, range(n_txt), inplace=True)
+        qc.compose(qc_img, range(n_txt, n_total), inplace=True)
+
+        for i, q_out in enumerate(out_q):
+            img_q = n_txt + i 
+            qc.cx(q_out, img_q)
+            qc.h(q_out)
+        
+        if self.discard:
+            qc.measure(out_q, range(n_out))
+            qc.measure(range(n_txt, n_total), range(n_out, 2 * n_out))
+        else:
+            qc.measure(range(n_total), range(n_total))
+        return qc
+    
+    def _classical_shadows(self, qc_txt, qc_img, out_q):
+        qc_txt = self._strip_clbits(qc_txt)
+        qc_img = self._strip_clbits(qc_img)
+
+        n_q = qc_txt.num_qubits
+        cbits = len(out_q) if self.discard else n_q
+        qc = QuantumCircuit(n_q, cbits)
+        qc.compose(qc_txt, inplace=True)
+        qc.compose(qc_img.inverse(), qubits=out_q, inplace=True)
+        return qc
 
 class Emulator:
     def __init__(self, config, backend):
         self.config = config
         self.backend = backend
         self.shots = 64
+        self.nshadows = 100
+        self.discard = self.config.get('emulate', {}).get('discard', False)
+        self.meas_method = self.config.get('emulate', {}).get('measurement_method', 'compute_uncompute')
+        self.dataset_name = config['dataset']['name']
+        self.experiment_name = gen_id(config)
 
     def shot_estimation(self, nq_out, nq_ps, epsilon=0.01):    
+        if self.meas_method == "classical_shadows":
+            self.shots = 1
+            return
         req_shots = 0.25 / (epsilon ** 2)
-        raw_shots = req_shots * (2 ** nq_ps)
-        min_shots = (2 ** nq_out) * 10
-        final_shots = max(raw_shots, min_shots)
-        final_shots = int(math.ceil(final_shots))
-        self.shots = max(4096, min(final_shots, 1_000_000))
+        ps_factor = 1 if self.discard else (2 ** nq_ps)
+        raw_shots = req_shots * ps_factor
+        # min_shots = (2 ** nq_out) * 10
+        # final_shots = max(raw_shots, min_shots)
+        final_shots = int(math.ceil(raw_shots))
+        self.shots = min(final_shots, 1_000_000) # max(1024, min(final_shots, 1_000_000))
+
+    def shadow_estimation(self, nq_out, epsilon=0.01, confidence=0.95):
+        delta = 1.0 - confidence
+        shadow_norm = 3 ** nq_out
+        
+        raw_shadows = (shadow_norm * 2.0 * math.log(2.0 / delta)) / (epsilon ** 2)
+        
+        min_shadows = 10
+        max_shadows = 10_000
+        
+        optimal_shadows = max(min_shadows, min(int(math.ceil(raw_shadows)), max_shadows))
+        self.nshadows = optimal_shadows
 
     def run_circuit(self, qc_array, shots=None, batch_size=24):
         shots = shots if shots is not None else self.shots
         result_array = []
-        indices = range(len(qc_array))
-        chunks = [indices[i:i + batch_size] for i in range(0, len(qc_array), batch_size)]
+        chunks = [qc_array[i:i + batch_size] for i in range(0, len(qc_array), batch_size)]
 
-        for idx_list in tqdm(chunks, desc="Running Circuits"):
-            chunk_circs = [qc_array[i] for i in idx_list]
-            job = self.backend.run(chunk_circs, shots=shots)
-            result = job.result()
-            for i, idx in enumerate(idx_list):
-                qc = qc_array[idx]
-                counts = result.get_counts(i)
+        for chunk in tqdm(chunks, desc="Running Circuits"):
+            if self.meas_method == "classical_shadows":
+                exec_chunk, shadow_metas = self.process_shadow_chunk(chunk)
+                job = self.backend.run(exec_chunk, shots=shots)
+                result = job.result()
+                for i, meta in enumerate(shadow_metas):
+                    offset = i * self.nshadows
+                    sample_counts = [result.get_counts(offset + s) for s in range(self.nshadows)]
+                    fidelity = self._eval_classical_shadows(meta["bases"], meta["nout"], meta["num_clbits"], sample_counts)
+                    result_array.append(fidelity)
+            else:
+                job = self.backend.run(chunk, shots=shots)
+                result = job.result()
 
-                output_qubits = qc.metadata.get("output_qubits", [])
-                num_clbits = qc.num_clbits
-                zero_str = "0" * num_clbits
+                for i, qc in enumerate(chunk):
+                    counts = result.get_counts(i)
+                    
+                    if self.meas_method == "compute_uncompute":
+                        fidelity = self._eval_compute_uncompute(qc, counts)
+                    elif self.meas_method == "destructive_swap":
+                        fidelity = self._eval_destructive_swap(qc, counts)
+                    else:
+                        raise ValueError(f"Unknown measurement method: {self.meas_method}")
+                    result_array.append(fidelity)
+        
+        return torch.tensor(result_array, dtype=torch.float32)
+    
+    def _eval_compute_uncompute(self, qc, counts):
+        total_shots = sum(counts.values())
+        if total_shots == 0:
+            return 0.0
 
-                check_indices = [num_clbits - 1 - b for b in range(num_clbits) if b not in output_qubits]
-                accepted_shots = 0
-                all_zero_shots = 0
+        out_qs = set(qc.metadata.get("output_qubits", []))
+        num_out = len(out_qs) if out_qs else qc.num_clbits
 
-                for bitstring, count in counts.items():
-                    if all(bitstring[idx_bit] == '0' for idx_bit in check_indices):
-                        accepted_shots += count
-                        if bitstring == zero_str:
-                            all_zero_shots += count
+        if self.discard:
+            target_str = "0" * num_out
+            return counts.get(target_str, 0) / total_shots
+        else:
+            success_shots = 0
+            for bstr, count in counts.items():
+                rev_bstr = bstr[::-1]  # Align string indices with qubit indices
+                if all(rev_bstr[q] == '0' for q in out_qs):
+                    success_shots += count
 
-                fidelity = all_zero_shots / accepted_shots if accepted_shots > 0 else 0.0
-                result_array.append(fidelity)
-                
-        result_tensor = 0.5 + (0.5 * torch.tensor(result_array))
-        return torch.asin(result_tensor.abs().clamp(0, 1))
+            return success_shots / total_shots
+        
+    def _eval_destructive_swap(self, qc, counts):
+        n_out = len(qc.metadata.get("output_qubits", range(qc.num_clbits)))
+        num_clbits = qc.num_clbits
 
-    def run_experiment(self, pos_circs, neg_circs, batch_size=24):
+        accepted_shots = sum(counts.values())
+        weighted_parity_sum = 0
+        
+        for bstr, count in counts.items():
+            txt_bits = [int(bstr[num_clbits - 1 - i]) for i in range(n_out)]
+            img_bits = [int(bstr[num_clbits - 1 - (n_out + i)]) for i in range(n_out)]
+            parity = sum(a * b for a, b in zip(txt_bits, img_bits)) % 2
+            weighted_parity_sum += count * (1 if parity == 0 else -1)
+        return max(0.0, weighted_parity_sum / accepted_shots) if accepted_shots > 0 else 0.0
+    
+    def process_shadow_chunk(self, chunk):
+        exec_chunk = []
+        shadow_metas = []
+
+        for qc in chunk:
+            out_q = qc.metadata["output_qubits"]
+            n_out = len(out_q)
+            cbits = n_out if self.discard else qc.num_qubits
+            bases_list = []
+
+            for _ in range(self.nshadows):
+                qc_shadow = qc.copy()
+                bases = np.random.choice([0, 1, 2], size=n_out)  # 0=Z, 1=X, 2=Y
+                bases_list.append(bases)
+
+                for i, q in enumerate(out_q):
+                    if bases[i] == 1: qc_shadow.ry(-np.pi / 2, q) # X basis: RY(-pi/2)
+                    elif bases[i] == 2: qc_shadow.rx(np.pi / 2, q) # Y basis: RX(pi/2)
+
+                if self.discard: qc_shadow.measure(out_q, range(n_out))
+                else: qc_shadow.measure(range(qc.num_qubits), range(cbits))
+                exec_chunk.append(qc_shadow)
+
+            shadow_metas.append({
+                "bases": bases_list,
+                "nout": n_out,
+                "num_clbits": cbits
+            })
+
+        return exec_chunk, shadow_metas
+
+    def _eval_classical_shadows(self, bases_list, nout, num_clbits, counts_list):
+        shadow_estimates = []
+        for bases, counts in zip(bases_list, counts_list):
+            total_shots = sum(counts.values())
+            if total_shots == 0:
+                shadow_estimates.append(0.0)
+                continue
+
+            exp_val = 0.0
+            for bstr, count in counts.items():
+                bits = [int(bstr[num_clbits - 1 - i]) for i in range(nout)]
+                val = 1.0
+                for bit, b in zip(bits, bases):
+                    val *= (2.0 if bit == 0 else -1.0) if b == 0 else 0.5
+                exp_val += val * (count / total_shots)
+
+            shadow_estimates.append(exp_val)
+
+        return float(np.mean(shadow_estimates))
+
+    def log_experiment(self, data, exec_time, einsum_data):
+        mlf_db_path = Path.cwd() / f"mlf_dbs/{self.dataset_name}.db"
+        mlf_db_path.parent.mkdir(parents=True, exist_ok=True)
+        mlflow.pytorch.autolog(log_models=False)
+        mlflow.set_tracking_uri(f"sqlite:///{mlf_db_path}")
+        mlflow.set_experiment(self.dataset_name+'emul')
+
+        meas_method = self.config.get('emulate', {}).get('measurement_method', 'compute_uncompute')
+        with mlflow.start_run(run_name=f"{self.experiment_name}"):
+            mlflow.log_params({
+                "dataset": self.dataset_name,
+                "measurement_method": meas_method,
+                "discard_qubits": self.config.get('emulate', {}).get('discard', False),
+                "epsilon": self.config.get('emulate', {}).get('eps', 0.01),
+                "shots": self.shots,
+                "nshadows": self.nshadows,
+                "backend_method": self.config.get('emulate', {}).get('backend', 'statevector'),
+                "noise_enabled": self.config.get("noise", False), 
+                "vision_method": self.config.get('vision', {}).get('method'),
+            })
+
+            if einsum_data:
+                max_dict = {'max_qubits': einsum_data['max'][0], 
+                            'max_gates': einsum_data['max'][1], 
+                            'max_depth': einsum_data['max'][2], 
+                            'max_intermediate_state': einsum_data['max'][3], 
+                            'max_2q_gates': einsum_data['max'][4]}
+                mlflow.log_metrics(max_dict)
+                avg_dict = {'avg_qubits': einsum_data['avg'][0], 
+                            'avg_gates': einsum_data['avg'][1], 
+                            'avg_depth': einsum_data['avg'][2], 
+                            'avg_intermediate_state': einsum_data['avg'][3], 
+                            'avg_2q_gates': einsum_data['avg'][4]}
+                mlflow.log_metrics(avg_dict)
+            
+            mlflow.log_metrics({'execution_time': exec_time, 'accuracy': data['accuracy']})
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                raw_pkl_path = Path(tmp_dir) / "raw_data.pkl"
+                with open(raw_pkl_path, "wb") as f:
+                    pickle.dump(data, f)
+                mlflow.log_artifact(str(raw_pkl_path), artifact_path="raw_outputs")
+        print(f" Logged run metrics & artifacts to: {mlf_db_path}")
+
+    def run_experiment(self, pos_circs, neg_circs, batch_size=24, einsum_data=None):
         start_eval_time = time.time()
-        pos_f = self.run_circuit(pos_circs, batch_size)
-        neg_f = self.run_circuit(neg_circs, batch_size)
+        pos_raw = self.run_circuit(pos_circs, batch_size)
+        neg_raw = self.run_circuit(neg_circs, batch_size)
+
+        if self.discard:
+            all_raw = torch.cat([pos_raw, neg_raw])
+            f_min, f_max = all_raw.min(), all_raw.max()
+            if f_max - f_min >= 1e-6:
+                pos_raw = (pos_raw - f_min) / (f_max - f_min)
+                neg_raw = (neg_raw - f_min) / (f_max - f_min)
+        pos_f = torch.asin((0.5 + 0.5 * pos_raw).abs().clamp(0, 1))
+        neg_f = torch.asin((0.5 + 0.5 * neg_raw).abs().clamp(0, 1))
+
         elapsed = time.time() - start_eval_time
         print(f"    Completed in {elapsed:.2f}s")
 
-        run_type = "noisy" if self.config.get("noise") else "noiseless"
-        run_name = gen_id(self.config)
-        save_filename = f"results/{self.config['dataset']['name']}/{run_name}_{run_type}"
-        if run_type == "noisy":
-            save_filename += f"{self.config['eps']}"
-        save_filename += "_margins.pkl"
-
-        def to_ndarray(x):
-            if isinstance(x, torch.Tensor):
-                return x.detach().cpu().numpy().flatten()
-            return np.asarray(x).flatten()
-
-        pos_arr = to_ndarray(pos_f)
-        neg_arr = to_ndarray(neg_f)
+        pos_arr = pos_f.detach().cpu().numpy().flatten()
+        neg_arr = neg_f.detach().cpu().numpy().flatten()
         margins = pos_arr - neg_arr
         correct = margins > 0
+        accuracy = np.mean(correct)
 
-        data = {"pos_scores": pos_arr, "neg_scores": neg_arr, "margin": margins, "correct": correct}
-        os.makedirs(os.path.dirname(save_filename), exist_ok=True)
-        store_pkl(data, save_filename)
-        print(f" Saved emulation results to {save_filename}")
+        data = {"accuracy": accuracy, "pos_scores": pos_arr, "neg_scores": neg_arr, "margin": margins, "correct": correct}
+        self.log_experiment(data, elapsed, einsum_data)
         return data

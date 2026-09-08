@@ -39,7 +39,7 @@ class RunManager:
 
         mlflow.pytorch.autolog(log_models=False)
         mlflow.set_tracking_uri(f"sqlite:///{mlf_db_path}")
-        mlflow.set_experiment(self.dataset_name)
+        mlflow.set_experiment(self.dataset_name+'_train')
 
     def _save_checkpoint(self, epoch, loss, metrics, is_best=False):
         payload = {

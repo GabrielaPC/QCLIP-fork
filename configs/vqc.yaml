@@ -8,20 +8,22 @@ embedding_qubits: 9
 emulate:
   set: "swap"
   noise: false
-  eps: 0.01
-  method: "statevector" # 'statevector', 'tensor_network', 'matrix_product_state', 'density_matrix'
+  eps: 0.1
+  backend: "statevector" # 'statevector', 'tensor_network', 'matrix_product_state', 'density_matrix'
+  discard: true
+  measurement_method: 'compute_uncompute' # 'compute_uncompute', 'destructive_swap', or 'classical_shadows'
 
 text:
   ansatz: "custom_v5"
   n: 1
   s: 1
   p: 1
-  layers: 2
+  layers: 1
   curry: true
   spider: false
 
 vision:
-  layers: 4
+  layers: 2
   method: 'mlp' # 'amp' or 'pca' or 'mlp'
 
 dataset:

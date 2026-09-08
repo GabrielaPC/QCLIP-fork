@@ -17,7 +17,7 @@ def main():
     config, DEV, _ = setup_exp(args.config)
 
     log_phase("Evaluation Environment")
-    print(f" Target Device   : {DEV} | Weights : ")
+    print(f" Target Device   : {DEV} ")
 
     log_phase("Instantiating Architecture")
     ansatz, image_model, text_model, _ = build_experiment(config, DEV)
@@ -37,7 +37,7 @@ def main():
     log_phase("Loading Model Checkpoint Weights")
     if args.checkpoint is not None:
         checkpoint_path = Path(args.checkpoint)
-        checkpoint = CheckpointManager.load_model_weights(checkpoint_path, image_model, text_model, DEV)
+        checkpoint = CheckpointManager.load_model(checkpoint_path, image_model, text_model, DEV)
         print(f" Recovered from ({checkpoint_path.name}) Epoch: {checkpoint.get('epoch', 'N/A')} | Historical Loss: {checkpoint.get('train_loss', 'N/A')}")
 
     image_model.eval()
@@ -54,15 +54,15 @@ def main():
     max_nq = max(qc.num_qubits for qc in pos_circs + neg_circs)
     nq_out = config['embedding_qubits']
     emulator.shot_estimation(nq_out, max_nq - nq_out, epsilon=config['emulate']['eps'])
+    if config['emulate']['measurement_method'] == 'classical_shadows': emulator.shadow_estimation(nq_out, config['emulate']['eps'])
     print(f" Simulating quantum states across {len(pos_circs)} pairs with {emulator.shots} shot resolution")
     data = emulator.run_experiment(pos_circs, neg_circs, batch_size=64)
-    acc = sum(data['correct']) / len(data['correct'])
 
     log_phase("Benchmark Emulation Results")
     print(f" {'Metric Key':<35} | {'Value / Score':<15}")
     print(" " + "—" * 53)
     print(f"  {'Evaluated Dataset Pairs':<34} | {len(pos_circs):.6f}")
-    print(f"  {'Pipeline Cumulative Accuracy':<34} | \033[92m{acc:.6f}\033[0m")
+    print(f"  {'Pipeline Cumulative Accuracy':<34} | \033[92m{data['accuracy']:.6f}\033[0m")
     print(" " + "—" * 53 + "\n")
 
 if __name__ == "__main__":

@@ -88,5 +88,4 @@ class FS_InfoNCE(nn.Module):
             mask = ~torch.eye(B, dtype=torch.bool, device=text_emb.device)
             purity_penalty = txt_logits[mask].mean()
             return sym_loss + self.lambda_reg * purity_penalty
-            
         return sym_loss
