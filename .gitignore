@@ -3,7 +3,7 @@ mlflow.deb
 .vscode/
 images/
 data/
-/.data 
+.data/
 data_compact/
 results/
 *.db
