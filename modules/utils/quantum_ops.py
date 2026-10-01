@@ -52,12 +52,19 @@ def amplitude_encoding(vector):
 
     return state_vector
 
-def tn2qiskit(einsum_expr, gate_arr, param_dict={}, meas_output=True):
-    input_indices, output_indices = einsum_expr
+def tn2qiskit(einsum_expr, gate_arr, param_dict={}, out_q=None, meas_output=True):
+    if isinstance(einsum_expr, str):
+        lhs, rhs = einsum_expr.split('->')
+        input_indices = [list(sub.replace('$', '')) for sub in lhs.split(',')]
+        output_indices = list(rhs.replace('$', ''))
+    else:
+        input_indices, output_indices = einsum_expr
+
     nq = sum(1 for gate in gate_arr if gate['op_type'] == '0')
     qreg = QuantumRegister(nq, f"qc{randint(1,10000)}")
     creg = ClassicalRegister(nq, f"c{randint(1,10000)}")
     qc = QuantumCircuit(qreg, creg)
+
     wire2q = defaultdict(list)
     qcounter = 0
     name2param = {}
@@ -69,6 +76,7 @@ def tn2qiskit(einsum_expr, gate_arr, param_dict={}, meas_output=True):
             wire2q[wire_name].append(qcounter)
             qcounter += 1
         elif gate['op_type'] == '0_dag':
+            # post_selection
             q_target = wire2q[idx_arr[0]].pop()
             qc.measure(q_target, q_target)
         else: 
@@ -87,16 +95,16 @@ def tn2qiskit(einsum_expr, gate_arr, param_dict={}, meas_output=True):
                     param = Parameter(gate['name'])
                     name2param[gate['name']] = param
                 gate_func(param, *q_targets)
+
                 if gate['name'] not in param_dict:
                     qiskit_param_dict[param] = np.random.rand() * 2 * np.pi
-                    # print(f"Warning: Parameter '{gate['name']}' not found in param_dict. Using random value {qiskit_param_dict[param]:.4f}.")
                 else:
                     qiskit_param_dict[param] = param_dict[gate['name']]
 
             for w, q in zip(out_wires, q_targets):
                 wire2q[w].append(q) 
 
-    output_qubits = []
+    # bell-test
     for wire_name, q_list in wire2q.items():
         if len(q_list) == 2:
             q_left, q_right = q_list
@@ -104,7 +112,13 @@ def tn2qiskit(einsum_expr, gate_arr, param_dict={}, meas_output=True):
             qc.h(q_left)
             qc.measure(q_left, q_left)
             qc.measure(q_right, q_right)
-        elif len(q_list) == 1:
+
+    output_qubits = []
+    sentence_wires = output_indices[:out_q] if out_q is not None else output_indices
+
+    for wire_name in sentence_wires:
+        q_list = wire2q[wire_name]
+        if len(q_list) == 1:
             q_out = q_list[0]
             if meas_output:
                 qc.measure(q_out, q_out)

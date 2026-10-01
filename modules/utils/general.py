@@ -70,10 +70,15 @@ def serialise_subsapce(sub_config):
     return "_".join(parts)
 
 def gen_id(config):
+    q = str(config['embedding_qubits'])
+    if 'discard' in config and config['discard']:
+        q += 'd'
+    else:
+        q += 'p'
     t_str = f"t_{serialise_subsapce(config['text'])}"
     v_str = f"v_{serialise_subsapce(config['vision'])}"
     timestamp = datetime.now().strftime('%m%d_%H%M')
-    return f"{t_str}__{v_str}__{timestamp}"
+    return f"q{q}__{t_str}__{v_str}__{timestamp}"
 
 def setup_exp(config_path: str):
     logging.getLogger("alembic").setLevel(logging.WARNING)

@@ -1,21 +1,22 @@
 import torch.nn as nn
 from itertools import count
-import torch
+import torch, math
 import numpy as np
 from sklearn.decomposition import PCA, IncrementalPCA
 from opt_einsum import contract_expression
 from modules.compilation.quantum.gates import *
 
 class QuantumFeatureMap(nn.Module):
-    def __init__(self, k: int, layers: int, batch_size: int, id_init=False, method='mlp'):
+    def __init__(self, k: int, layers: int, batch_size: int, out_dim: int = None, id_init=False, method='mlp', discard=False):
         super().__init__()
         self.k = k
-        self.out_dim = 2 ** k
+        self.out_dim = 2 ** k if out_dim is None else out_dim
         self.layers = layers
         self.batch_size = batch_size
         self.params = nn.ParameterList([])
         self.sym2param = {}
         self.method = method
+        self.discard = discard
 
         if self.method == 'mlp':
             self.projector = nn.Sequential(
@@ -189,4 +190,63 @@ class QuantumFeatureMap(nn.Module):
                     idx = self.sym2param[symbol]
                     tensor_arr.append(CRz(thetas[idx]))
 
-        return self.contraction_path(*tensor_arr)   
+        if self.discard:
+            pure_state = self.contraction_path(*tensor_arr)
+            batch_dim = pure_state.shape[0]
+            pure_state = pure_state.reshape(batch_dim, 2**self.k, -1)
+            rho = torch.bmm(pure_state, pure_state.conj().transpose(1, 2))
+            return rho
+        else:
+            return self.contraction_path(*tensor_arr)   
+
+
+class QFMap_CPTP(nn.Module):
+    def __init__(self, base_image_model: nn.Module, gamma: float = 0.3):
+        super().__init__()
+        self.image_model = base_image_model
+        self.gamma = gamma
+
+    # --- Delegate Einsum Attributes & Methods to Base Feature Map ---
+    @property
+    def einsum_expr(self):
+        return getattr(self.image_model, 'einsum_expr', None)
+
+    @property
+    def gate_arr(self):
+        return getattr(self.image_model, 'gate_arr', None)
+
+    def describe_einsum(self, *args, **kwargs):
+        if hasattr(self.image_model, 'describe_einsum'):
+            return self.image_model.describe_einsum(*args, **kwargs)
+        raise AttributeError(f"Base model {self.image_model.__class__.__name__} does not implement describe_einsum.")
+
+    def __getattr__(self, name: str):
+        # Fallback to base_image_model for any unhandled attributes (e.g., sym2param, fit_image_pca)
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.image_model, name)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        img_emb = self.image_model(x)
+        
+        orig_shape = img_emb.shape
+        B = img_emb.size(0)
+        
+        if img_emb.dim() == 2:
+            D = int(math.sqrt(img_emb.size(1)))
+            rho = img_emb.view(B, D, D).to(torch.complex64)
+        else:
+            D = img_emb.size(-1)
+            rho = img_emb.to(torch.complex64)
+
+        # Construct maximally mixed identity matrix 1/d * I_d
+        I_d = torch.eye(D, dtype=torch.complex64, device=img_emb.device).unsqueeze(0).expand(B, D, D)
+        rho_mixed = (1.0 / D) * I_d
+
+        # Apply Depolarizing Channel: (1 - gamma) * rho + gamma * (1/d * I)
+        rho_out = (1.0 - self.gamma) * rho + self.gamma * rho_mixed
+
+        if len(orig_shape) == 2:
+            return rho_out.view(B, D * D)
+        return rho_out

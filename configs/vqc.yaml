@@ -4,13 +4,16 @@ qlr: 0.001
 clr: 0.00001
 epochs: 100
 embedding_qubits: 9
+out_dim: 512
+discard: false
 
 emulate:
   set: "swap"
   noise: false
-  eps: 0.1
+  resolution: 50
+  optimization_level: 1
   backend: "statevector" # 'statevector', 'tensor_network', 'matrix_product_state', 'density_matrix'
-  discard: true
+  discard: false
   measurement_method: 'compute_uncompute' # 'compute_uncompute', 'destructive_swap', or 'classical_shadows'
 
 text:
@@ -18,7 +21,7 @@ text:
   n: 1
   s: 1
   p: 1
-  layers: 1
+  layers: 2
   curry: true
   spider: false
 

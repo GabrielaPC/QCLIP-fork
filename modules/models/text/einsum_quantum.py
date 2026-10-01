@@ -8,7 +8,7 @@ from modules.compilation.quantum.gates import *
 from modules.utils.general import get_device
 
 class VQCModel(nn.Module):
-    def __init__(self, out_q: int = 9, precision = torch.complex64):
+    def __init__(self, out_q: int = 9, discard=False, precision = torch.complex64):
         super().__init__()
         self.symbols: List[str] = []
         self.params = nn.ParameterList([])
@@ -16,6 +16,7 @@ class VQCModel(nn.Module):
         self.sym2param: Dict[str, nn.Parameter] = {}
         self.out_q: int = out_q
         self.precision: torch.dtype = precision
+        self.discard = discard
 
         h_gate = torch.tensor([[1.0, 1.0], [1.0, -1.0]], dtype=precision) / (2.0**0.5)
         cx_gate = torch.block_diag(
@@ -75,8 +76,18 @@ class VQCModel(nn.Module):
         self.unk_param_index = len(self.params)
         self.params.append(nn.Parameter(torch.zeros(1), requires_grad=False))
 
+    # def _get_params(self):
+    #     return {sym: float(self.params[idx].detach().cpu().item()) for sym, idx in self.sym2param.items()}
+
     def _get_params(self):
-        return {sym: float(self.params[idx].detach().cpu().item()) for sym, idx in self.sym2param.items()}
+        with torch.no_grad():
+            raw_tensor = torch.cat([p for p in self.params])
+            thetas = torch.tanh(raw_tensor) * 2 * torch.pi
+            
+            return {
+                sym: float(thetas[idx].detach().cpu().item()) 
+                for sym, idx in self.sym2param.items()
+            }
 
     def compile_batch(self, batch_recipes):
         groups = defaultdict(list)
@@ -114,11 +125,14 @@ class VQCModel(nn.Module):
         for i, (einsum_str, tensors) in enumerate(batch_recipes):
             groups[einsum_str].append((i, tensors))
 
-        thetas = torch.cat([p for p in self.params])
+        thetas = torch.tanh(torch.cat([p for p in self.params])) * 2 * torch.pi
         dev = thetas.device
 
         batch_size = len(batch_recipes)
-        results = torch.zeros(batch_size, *[2]*self.out_q, dtype=self.precision, device=dev)
+        if self.discard:
+            results = torch.zeros(batch_size, 2**self.out_q, 2**self.out_q, dtype=self.precision, device=dev)
+        else:
+            results = torch.zeros(batch_size, *[2]*self.out_q, dtype=self.precision, device=dev)
         for einsum_str, items in groups.items():
             indices, tensor_lists = zip(*items)
             minibatch_size = len(indices)
@@ -129,10 +143,6 @@ class VQCModel(nn.Module):
                     first_symbol, op_type = column[0]['name'], column[0]['op_type']
                     if first_symbol is None:
                         static_data = getattr(self, f"gate_{op_type}")
-                        # if op_type == '0': data = torch.tensor([1, 0], dtype=self.precision, device=dev)
-                        # elif op_type == '0_dag': data = torch.tensor([1, 0], dtype=self.precision, device=dev)
-                        # elif op_type == 'H': data = torch.tensor([[1.0, 1.0], [1.0, -1.0]], dtype=self.precision, device=dev) / (2.0**0.5)
-                        # elif op_type == 'CX': data = torch.block_diag(torch.eye(2, dtype=self.precision, device=dev), torch.tensor([[0.0,1.0],[1.0,0.0]], dtype=self.precision, device=dev)).reshape(2,2,2,2)
                         data = static_data.unsqueeze(0).expand(minibatch_size, *static_data.shape).contiguous()
                         shapes.append(data.shape)
                         stacked_tensors.append(data)
@@ -161,9 +171,25 @@ class VQCModel(nn.Module):
                 if cache_key not in self.path_cache:
                     self.path_cache[cache_key] = contract_expression(batched_str, *shapes)
                 group_out = self.path_cache[cache_key](*stacked_tensors, backend='torch')
-            
-                results[list(indices)] = group_out
+
+                if self.discard:
+                    elems_per_item = group_out.numel() // minibatch_size
+                    target_sent_dim = 2**self.out_q
+                    if elems_per_item >= target_sent_dim and elems_per_item % target_sent_dim == 0:
+                        sent_dim = target_sent_dim
+                        traced_dim = elems_per_item // sent_dim
+                    else:
+                        sent_dim = elems_per_item
+                        traced_dim = 1
+                    group_out = group_out.reshape(minibatch_size, sent_dim, traced_dim)
+                    rho = torch.bmm(group_out, group_out.conj().transpose(1, 2))
+                    results[list(indices)] = rho
+                else:    
+                    results[list(indices)] = group_out
             except Exception as e:
-                results[list(indices)] = torch.zeros(minibatch_size, *[2]*self.out_q, dtype=self.precision, device=dev)
+                if self.discard:
+                    results[list(indices)] = torch.zeros(minibatch_size, 2**self.out_q, 2**self.out_q, dtype=self.precision, device=dev)
+                else:
+                    results[list(indices)] = torch.zeros(minibatch_size, *[2]*self.out_q, dtype=self.precision, device=dev)
                 print(f"[Error] Failed to contract batch with error: {e}. Returning zeroed tensors for this batch.")
         return results

@@ -51,26 +51,35 @@ def analyse_einsum(einsum_expr, tarr, cache={}):
     nq = 0
     twoq_gates = 0
 
-    input_subs = einsum_expr.split('->')[0]
+    input_subs = einsum_expr.split('->')[0].split(',')
             
     for subscript, gate in zip(input_subs, tarr):
         symbol, op_type = gate['name'], gate['op_type']
-        if symbol is None:
-            if op_type == '0':
-                data_shape = torch.Size([2])
-                nq += 1
-            elif op_type == '0_dag':
-                data_shape = torch.Size([2])
-            elif op_type == 'H': data_shape = torch.Size([2, 2])
-            elif op_type == 'CX': 
-                data_shape = torch.Size([2, 2, 2, 2])
-                twoq_gates += 1
-        else:
-            if op_type in ['Rz', 'Rx', 'Ry']: data_shape = torch.Size([2, 2])
-            elif op_type in ['CRz', 'CRx', 'CRy']: 
-                data_shape = torch.Size([2, 2, 2, 2])
-                twoq_gates += 1
+
+        data_shape = torch.Size([2] * len(subscript))
         shapes.append(data_shape)
+
+        if op_type == '0': nq += 1
+        elif len(subscript) == 4: twoq_gates += 1
+
+        # if symbol is None:
+        #     if op_type == '0':
+        #         data_shape = torch.Size([2])
+        #         nq += 1
+        #     elif op_type == '0_dag':
+        #         data_shape = torch.Size([2])
+        #     elif op_type == 'H': 
+        #         data_shape = torch.Size([2, 2])
+        #     elif op_type == 'CX': 
+        #         data_shape = torch.Size([2, 2, 2, 2])
+        #         twoq_gates += 1
+        # else:
+        #     if op_type in ['Rz', 'Rx', 'Ry']: 
+        #         data_shape = torch.Size([2, 2])
+        #     elif op_type in ['CRz', 'CRx', 'CRy']: 
+        #         data_shape = torch.Size([2, 2, 2, 2])
+        #         twoq_gates += 1
+        # shapes.append(data_shape)
 
         if op_type not in ['0']:
             current_gate_max = 0
@@ -81,7 +90,6 @@ def analyse_einsum(einsum_expr, tarr, cache={}):
                 qubit_depths[char] = new_depth
 
     cdepth = max(qubit_depths.values()) if qubit_depths else 0
-    # dummy_operands = [np.empty(tuple(s), dtype=np.int8) for s in shapes]
     path_info = contract_path(einsum_expr, *shapes, shapes=True)
     max_width = int(np.log2(float(path_info[1].largest_intermediate)))
     ngates = len(tarr) - nq

@@ -1,5 +1,5 @@
 # factory.py
-from modules.compilation.quantum.ansatz import CustomV5Ansatz
+from modules.compilation.quantum.ansatz import CustomV5Ansatz, CustomV6Ansatz
 from modules.compilation.classical.tensor_network import TNCompiler
 from modules.compilation.classical.decompositions import MPS
 from modules.compilation.classical.neural import MLPCompiler
@@ -8,13 +8,12 @@ from modules.models.text.einsum_quantum import VQCModel
 from modules.models.text.einsum_classical import TNModel
 from modules.models.text.neural_model import MLPModel
 
-from modules.models.vision.quantum_map import QuantumFeatureMap
+from modules.models.vision.quantum_map import QuantumFeatureMap, QFMap_CPTP
 from modules.models.vision.clip import FrozenCLIP
 from modules.models.vision.image_model import TTNImageModel
 
-from modules.models.fusion.criteria import FS_InfoNCE, InfoNCE
+from modules.models.fusion.criteria import FS_InfoNCE, InfoNCE, UJ_InfoNCE
 import importlib
-import torch
 
 def load_obj(import_str: str):
     module_path, attr_name = import_str.rsplit('.', 1)
@@ -58,10 +57,18 @@ def build_experiment(config, device):
             image_model = QuantumFeatureMap(k=config['embedding_qubits'], 
                                             layers=config['vision']['layers'], 
                                             batch_size=config['batch_size'], 
+                                            out_dim=config['out_dim'],
                                             id_init=False, 
+                                            discard=config['discard'],
                                             method=config['vision']['method']).to(device)
-        text_model = VQCModel(out_q=config['embedding_qubits']).to(device)
-        loss_fn = FS_InfoNCE()
+            if config['discard']:
+                image_model = QFMap_CPTP(base_image_model=image_model)
+
+        text_model = VQCModel(out_q=config['embedding_qubits'], discard=config['discard']).to(device)
+        if config['discard']:
+            loss_fn = UJ_InfoNCE(label_smoothing=0.1)
+        else:
+            loss_fn = FS_InfoNCE(label_smoothing=0.1)
         
     elif model_type == "mlp":
         ansatz = MLPCompiler()

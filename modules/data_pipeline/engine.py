@@ -25,6 +25,7 @@ class DataEngine:
         compile_kwargs = {}
         if self.config["model_type"] == "vqc":
             compile_kwargs["curry"] = self.config["text"].get("curry", False)
+            compile_kwargs["discard"] = self.config["text"].get("discard", False)
             compile_kwargs["spider"] = self.config["text"].get("spider", False)
             
         if split == 'train' or split == 'val':
@@ -71,13 +72,13 @@ class DataEngine:
                 einsum_arr += data[einsum_col].tolist()
             tn_arr = list(zip(einsum_arr, symbol_arr))
             metrics = tn_metadata(tn_arr)
-            print(f"Circuit Metrics for {model.__class__.__name__}:")
-            print(f"(Max) Qubits: {metrics['max'][0]:.4f} | Gates: {metrics['max'][1]:.4f} | Depth: {metrics['max'][2]:.4f} | Rank: {metrics['max'][3]:.4f} | 2-Qubit Gates: {metrics['max'][4]:.4f}")
-            print(f"(Avg) Qubits: {metrics['avg'][0]:.4f} | Gates: {metrics['avg'][1]:.4f} | Depth: {metrics['avg'][2]:.4f} | Rank: {metrics['avg'][3]:.4f} | 2-Qubit Gates: {metrics['avg'][4]:.4f}")
+            print(f"Metrics for {model.__class__.__name__}:")
+            print(f" (Max) Qubits: {metrics['max'][0]:.4f} | Gates: {metrics['max'][1]:.4f} | Depth: {metrics['max'][2]:.4f} | Rank: {metrics['max'][3]:.4f} | 2-Qubit Gates: {metrics['max'][4]:.4f}")
+            print(f" (Avg) Qubits: {metrics['avg'][0]:.4f} | Gates: {metrics['avg'][1]:.4f} | Depth: {metrics['avg'][2]:.4f} | Rank: {metrics['avg'][3]:.4f} | 2-Qubit Gates: {metrics['avg'][4]:.4f}")
         elif hasattr(model, "einsum_expr"):
             metrics = analyse_einsum(model.einsum_expr.replace('b', ''), model.gate_arr)
-            print(f"Circuit Metrics for {model.__class__.__name__}:")
-            print(f"Qubits: {metrics[0]:.4f} | Gates: {metrics[1]:.4f} | Depth: {metrics[2]:.4f} | Rank: {metrics[3]:.4f} | 2-Qubit Gates: {metrics[4]:.4f}")
+            print(f"Metrics for {model.__class__.__name__}:")
+            print(f" Qubits: {metrics[0]:.4f} | Gates: {metrics[1]:.4f} | Depth: {metrics[2]:.4f} | Rank: {metrics[3]:.4f} | 2-Qubit Gates: {metrics[4]:.4f}")
         else:
             raise ValueError(f"Model {model.__class__.__name__} does not support einsum description.")
         if return_metrics:

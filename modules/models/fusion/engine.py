@@ -1,4 +1,5 @@
-import torch, yaml, mlflow, time, socket
+import torch, yaml, mlflow, time, socket, math
+from collections import defaultdict
 from typing import Callable
 import torch.nn.functional as F
 from modules.utils.general import gen_id, log_phase
@@ -11,12 +12,13 @@ svo_mapper = lambda batch: (batch["pos_image"], batch["caption"])
 
 
 class RunManager:
-    def __init__(self, config, trainer, evaluator, device, seed):
+    def __init__(self, config, trainer, evaluator, device, seed, scheduler=None):
         self.config = config
         self.trainer = trainer
         self.evaluator = evaluator
         self.device = device
         self.seed = seed
+        self.scheduler = scheduler
 
         self.dataset_name = config['dataset']['name']
         self.model_type = config['model_type']
@@ -55,13 +57,16 @@ class RunManager:
 
     def fit(self, train_loader, val_loader, eval_mapper):
         self._setup_environment()
-        
         hostname = socket.gethostname()
-        
         log_phase(f"Model #{self.run_name}: optimization started on \"{hostname}\"...")
         
         best_metric_value = float("-inf")
         target_metric = "i2tR1" if 'global_retrieval' in self.eval_tasks else 'hard_neg_acc'
+
+        patience = self.config.get('patience', 15)
+        min_delta = self.config.get('min_delta', 1e-3)
+        patience_counter = 0
+        stopped_epoch = 0
 
         with mlflow.start_run(run_name=self.run_name):
             mlflow.log_params({
@@ -69,6 +74,7 @@ class RunManager:
                 "batch_size": self.config['batch_size'],
                 "learning_rate_quantum": self.config['qlr'],
                 "learning_rate_classical": self.config['clr'],
+                "embedding_qubits": self.config.get('embedding_qubits', 0),
                 "temperature_parameter": self.trainer.loss_fn.temperature,
                 "device_target": str(self.device),
                 "seed": self.seed,
@@ -76,14 +82,24 @@ class RunManager:
                 "image_tower": type(self.trainer.image_model).__name__,
                 "execution_host": hostname,
                 "model_path": str(self.checkpoint_path),
+                "early_stopping_patience": patience,
+                "early_stopping_min_delta": min_delta,
             })
 
             epoch_pbar = tqdm(range(self.config['epochs']), desc="Training Pipeline", unit="epoch")
+            current_lr = self.config.get('qlr', 1e-3)
             
             for epoch in epoch_pbar:
                 start_time = time.time()
                 loss = self.trainer.train_epoch(train_loader, eval_mapper)
                 elapsed_time = time.time() - start_time
+
+                grad_norm_dict = self.trainer.grad_norm_by_type()
+
+                if self.scheduler is not None:
+                    self.scheduler.step()
+                    current_lr = self.scheduler.get_last_lr()[0]
+                    mlflow.log_metric("learning_rate", current_lr, step=epoch)
 
                 metrics = self.evaluator.eval_set(
                     dataloader=val_loader,
@@ -92,15 +108,30 @@ class RunManager:
                 )
 
                 mlflow.log_metrics(metrics, step=epoch)
+                for k, v in grad_norm_dict.items():
+                    mlflow.log_metric(f"gradient_norm_{k}", v, step=epoch)
                 metrics_str = " | ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
-                tqdm.write(f" Epoch {epoch:02d} | Loss: {loss:.4f} | {metrics_str} | Time: {elapsed_time:.1f}s")
+                tqdm.write(f"\nEpoch {epoch:02d} | Loss: {loss:.4f} | Gradient Norms: {', '.join([f'{k}: {v:.4f}' for k, v in grad_norm_dict.items()])} | {metrics_str} | Time: {elapsed_time:.1f}s")
 
                 current_metric = metrics.get(target_metric, 0.0)
-                is_best = current_metric > best_metric_value
-                if is_best:
+                if current_metric > (best_metric_value + min_delta):
                     best_metric_value = current_metric
+                    patience_counter = 0
+                    is_best = True
+                else:
+                    patience_counter += 1
+                    is_best = False
 
                 self._save_checkpoint(epoch, loss, metrics, is_best=is_best)
+
+                if patience_counter >= patience:
+                    stopped_epoch = epoch
+                    tqdm.write(
+                        f"\n[EARLY STOPPING TRIGGERED] Metric '{target_metric}' failed to improve by > {min_delta} "
+                        f"for {patience} consecutive epochs. Best Score: {best_metric_value:.4f} (at epoch {epoch - patience})."
+                    )
+                    mlflow.log_metric("early_stopped_epoch", stopped_epoch)
+                    break
                 
         log_phase("Experiment Run Concluded")
 
@@ -111,6 +142,58 @@ class ContrastiveTrainer:
         self.optimizer = optimizer
         self.loss_fn = loss_fn
         self.device = device
+
+    @torch.no_grad()
+    def grad_norm(self):
+        grad_norm = 0.0
+
+        for _, param in list(self.image_model.named_parameters()) + list(self.text_model.named_parameters()):
+            if param.grad is not None:
+                grad_norm += param.grad.data.norm(2).item() ** 2
+        return grad_norm ** 0.5
+
+    @torch.no_grad()
+    def grad_norm_by_type(self) -> dict:
+        verb_grad_sq = 0.0
+        noun_grad_sq = 0.0
+        other_grad_sq = 0.0
+
+        sym2param = getattr(self.text_model, 'sym2param', {})
+        param2sym = {idx: sym for sym, idx in sym2param.items()}
+
+        for name, param in self.text_model.named_parameters():
+            if param.grad is None:
+                continue
+
+            g_norm_sq = param.grad.data.norm(2).item() ** 2
+
+            if "params" in name:
+                try:
+                    idx = int(name.split(".")[-1])
+                    sym_name = param2sym.get(idx, "")
+                except ValueError:
+                    sym_name = ""
+            else:
+                sym_name = name
+
+            # print(sym_name.split('__')[1].split('_')[0].split('@'))
+            cmplx_type = sym_name.split('__')[1].split('_')[0].split('@')
+            op_arity = len(cmplx_type)
+            cmplx_type = ''.join(cmplx_type)
+
+            if cmplx_type == 'n':
+                noun_grad_sq += g_norm_sq
+            elif op_arity == 3:
+                verb_grad_sq += g_norm_sq
+            else:
+                other_grad_sq += g_norm_sq
+
+        return {
+            "verb_grad_norm": verb_grad_sq ** 0.5,
+            "noun_grad_norm": noun_grad_sq ** 0.5,
+            "other_grad_norm": other_grad_sq ** 0.5,
+            "total_text_grad_norm": (verb_grad_sq + noun_grad_sq) ** 0.5
+        }
 
     def train_epoch(self, dataloader, batch_mapper: Callable) -> float:
         self.image_model.train()
@@ -134,6 +217,52 @@ class ContrastiveTrainer:
         
         return epoch_loss / len(dataloader.dataset)
 
+def adaptive_optimizer(text_model, image_model, base_qlr: float = 1e-3, base_clr: float = 1e-5, 
+                       arity_factor: float = 1.5, weight_decay: float = 0.01) -> torch.optim.AdamW:
+    
+    sym2param = getattr(text_model, 'sym2param', {})
+    param2sym = {idx: sym for sym, idx in sym2param.items()}
+    arity_param_groups = defaultdict(list)
+
+    for name, param in text_model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        if "params" in name:
+            try:
+                idx = int(name.split(".")[-1])
+                sym_name = param2sym.get(idx, "")
+            except ValueError:
+                sym_name = ""
+        else:
+            sym_name = name
+
+        cmplx_type = sym_name.split('__')[1].split('_')[0].split('@')
+        op_arity = max(1, len(cmplx_type))
+        arity_param_groups[op_arity].append(param)
+
+    param_groups = []
+    
+    for arity in sorted(arity_param_groups.keys()):
+        params = arity_param_groups[arity]
+        group_lr = base_qlr * (arity_factor ** (arity - 1))
+        
+        param_groups.append({
+            'params': params,
+            'lr': group_lr,
+            'name': f'q_text_arity_{arity}_lr_{group_lr:.1e}'
+        })
+        print(f"[Optimizer Config] Arity {arity} | {len(params)} params | LR: {group_lr:.6f}")
+
+    # Add classical image tower group
+    param_groups.append({
+        'params': image_model.parameters(),
+        'lr': base_clr,
+        'name': 'image_tower'
+    })
+    print("[Optimizer Config] Classical Image Tower | {} params | LR: {:.6f}".format(len(list(image_model.parameters())), base_clr))
+    return torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+
 class MMEvaluator:
     def __init__(self, image_model, text_model, device):
         self.image_model = image_model.to(device)
@@ -142,11 +271,13 @@ class MMEvaluator:
 
     @torch.no_grad()
     def _encode_txt(self, texts):
-        return F.normalize(self.text_model(texts).flatten(1), dim=1)
+        return self.text_model(texts).flatten(1).contiguous()
+        # return F.normalize(self.text_model(texts).flatten(1), dim=1)
     
     @torch.no_grad()
     def _encode_img(self, images):
-        return F.normalize(self.image_model(images.to(self.device)).flatten(1), dim=1)
+        return self.image_model(images.to(self.device)).flatten(1).contiguous()
+        # return F.normalize(self.image_model(images.to(self.device)).flatten(1), dim=1)
     
     def _calculate_recall(self, scores: torch.Tensor, mask: torch.Tensor, prefix: str):
         rankings = scores.argsort(dim=1, descending=True)
@@ -310,6 +441,49 @@ class MMEvaluator:
             total += i0.size(0)
         
         return {"txt_score": text_corr/total, "img_score": img_corr/total, "grp_score": group_corr/total}
+
+    @torch.no_grad()
+    def cptp_diagnostic(self, dataloader, choice="text") -> dict:
+        self.image_model.eval()
+        self.text_model.eval()
+
+        sum_text_purity = 0.0
+        total_samples = 0
+        metrics = {}
+
+        for batch in dataloader:
+            if choice == "text":
+                m1_emb = self._encode_img(batch["image"])
+                pos_m2_emb = self._encode_txt(batch["pos_caption"])
+                neg_m2_emb = self._encode_txt(batch["neg_caption"])
+                text_tensors = [pos_m2_emb, neg_m2_emb]
+            elif choice == "image":
+                m1_emb = self._encode_txt(batch["caption"])
+                pos_m2_emb = self._encode_img(batch["pos_image"])
+                neg_m2_emb = self._encode_img(batch["neg_image"])
+                text_tensors = [m1_emb]
+
+            batch_purity_sum = 0.0
+            for txt_emb in text_tensors:
+                B = txt_emb.size(0)
+                if txt_emb.dim() == 2:
+                    D = int(math.sqrt(txt_emb.size(1)))
+                    rho = txt_emb.view(B, D, D).to(torch.complex64)
+                else:
+                    rho = txt_emb.to(torch.complex64)
+                sample_purities = torch.real(torch.einsum('bmn,bnm->b', rho, rho))
+                batch_purity_sum += sample_purities.sum().item()
+
+            sum_text_purity += batch_purity_sum / len(text_tensors)
+            total_samples += m1_emb.size(0)
+
+
+        if total_samples == 0:
+                    return {}
+        
+        metrics["diag_mean_text_purity"] = sum_text_purity / total_samples
+
+        return metrics
     
     @torch.no_grad()
     def diagnostic(self, dataloader, choice="text") -> dict:
@@ -321,16 +495,19 @@ class MMEvaluator:
         sum_absolute_gap = 0.0
         total_samples = 0
 
+        metrics = {}
+
         for batch in dataloader:
             if choice == "text":
                 m1_emb = self._encode_img(batch["image"])
                 pos_m2_emb = self._encode_txt(batch["pos_caption"])
                 neg_m2_emb = self._encode_txt(batch["neg_caption"])
+                text_tensors = [pos_m2_emb, neg_m2_emb]
             elif choice == "image":
                 m1_emb = self._encode_txt(batch["caption"])
                 pos_m2_emb = self._encode_img(batch["pos_image"])
                 neg_m2_emb = self._encode_img(batch["neg_image"])
-
+                text_tensors = [m1_emb]
             
             # Replicating your model's native similarity metric calculation
             pos_sim = torch.sum(m1_emb.conj() * pos_m2_emb, dim=1).abs()
@@ -346,18 +523,24 @@ class MMEvaluator:
 
         if total_samples == 0:
             return {}
+        
+        metrics["diag_mean_pos_overlap"] = sum_pos_sim / total_samples
+        metrics["diag_mean_neg_overlap"] = sum_neg_sim / total_samples
+        metrics["diag_collapse_gap"] = sum_absolute_gap / total_samples
 
-        return {
-            "diag_mean_pos_overlap": sum_pos_sim / total_samples,
-            "diag_mean_neg_overlap": sum_neg_sim / total_samples,
-            "diag_collapse_gap": sum_absolute_gap / total_samples
-        }
+        return metrics
     
     def diagnostic_text_choice(self, dataloader) -> dict:
         return self.diagnostic(dataloader, choice="text")
     
     def diagnostic_image_choice(self, dataloader) -> dict:
         return self.diagnostic(dataloader, choice="image")
+
+    def cptp_diagnostic_text_choice(self, dataloader) -> dict:
+        return self.cptp_diagnostic(dataloader, choice="text")
+
+    def cptp_diagnostic_image_choice(self, dataloader) -> dict:
+        return self.cptp_diagnostic(dataloader, choice="image")
     
     @torch.no_grad()
     def eval_set(self, dataloader, tasks, eval_mapper) -> dict:

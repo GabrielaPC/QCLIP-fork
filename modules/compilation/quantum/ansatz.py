@@ -14,16 +14,16 @@ class BaseAnsatz(ABC):
         self.id = type(self).__name__ + '_' + str(obmap['n']) + '_' + str(obmap['s']) + '_' + str(obmap['p']) + '_' + str(obmap['out'])
         self.char_idx = count(0)
 
-    def __call__(self, tn, curry=False, spider=False):
+    def __call__(self, tn, curry=False, discard=False, spider=False):
         if curry:
-            return self.tn2ansatz_curried(tn)
+            return self.tn2ansatz_curried(tn,  discard=discard)
         elif spider:
             return self.spider(tn)
         else:
-            return self.tn2ansatz(tn)
+            return self.tn2ansatz(tn, discard=discard)
 
-    def tns2ansatze(self, tn_arr, curry=False, spider=False):
-        return [self(tn, curry=curry, spider=spider) for tn in tn_arr]
+    def tns2ansatze(self, tn_arr, curry=False, discard=False, spider=False):
+        return [self(tn, curry=curry, discard=discard, spider=spider) for tn in tn_arr]
 
     def reset_char(self):
         self.char_idx = count(0)
@@ -50,13 +50,22 @@ class BaseAnsatz(ABC):
         idx_counts = Counter(all_idx)
         output_indices = [idx for idx, cnt in idx_counts.items() if cnt == 1]
 
-        root_indices = ccg_map.get(0, ccg_map.get('0', []))
+        if 0 in ccg_map:
+            root_indices = ccg_map[0]
+        elif '0' in ccg_map:
+            root_indices = ccg_map['0']
+        elif len(ccg_map) > 0:
+            root_indices = list(ccg_map.values())[0]
+        else:
+            root_indices = []
+
+        # root_indices = ccg_map.get(0, ccg_map.get('0', []))
         out_list = [i for i in root_indices if i in output_indices] + \
                    [i for i in output_indices if i not in root_indices]
         
         return interleaved2einsum(input_indices, out_list)
     
-    def tn2ansatz(self, tn):
+    def tn2ansatz(self, tn, discard=False):
         self.reset_char()
         ccg_map = {}
         input_indices, tensor_arr = [], []
@@ -81,15 +90,16 @@ class BaseAnsatz(ABC):
                 if idx not in ccg_map:
                     ccg_map[idx] = current_wires[i:i+n]
                 else:
-                    target_wires = ccg_map[idx]                    
-                    replace_map = dict(zip(current_wires[i:i+n], target_wires))
-                    input_indices = [[replace_map.get(w, w) for w in sub] for sub in input_indices]
+                    if not discard:
+                        target_wires = ccg_map[idx]                    
+                        replace_map = dict(zip(current_wires[i:i+n], target_wires))
+                        input_indices = [[replace_map.get(w, w) for w in sub] for sub in input_indices]
                 i += n
         
         einsum_expr = self.gen_einsum_expr(input_indices, ccg_map)
         return einsum_expr, tensor_arr
     
-    def tn2ansatz_curried(self, tn):
+    def tn2ansatz_curried(self, tn, discard=False):
         self.reset_char()
         ccg_map = {}
         input_indices, tensor_arr = [], []
@@ -128,18 +138,18 @@ class BaseAnsatz(ABC):
             input_indices.extend([[idx for idx in ten] for ten in new_indices])
             tensor_arr.extend(new_tensors)
             
-
             i = 0
             for idx, typ in zip(idx_arr, type_arr):
                 n = self.obmap.get(typ, 1)
                 ccg_map[idx] = current_wires[i:i+n]
                 i += n
 
-        for virtual_idx, physical_wires in ccg_map.items():
-            if virtual_idx != 0:
-                input_indices.extend([[w] for w in physical_wires])
-                # tensor_arr.extend([(None, '0_dag')] * len(physical_wires))
-                tensor_arr.extend([{'name': None, 'op_type': '0_dag'}] * len(physical_wires))
+        if not discard:
+            for virtual_idx, physical_wires in ccg_map.items():
+                if virtual_idx != 0:
+                    input_indices.extend([[w] for w in physical_wires])
+                    # tensor_arr.extend([(None, '0_dag')] * len(physical_wires))
+                    tensor_arr.extend([{'name': None, 'op_type': '0_dag'}] * len(physical_wires))
         
         einsum_expr = self.gen_einsum_expr(input_indices, ccg_map)
         return einsum_expr, tensor_arr
@@ -179,7 +189,7 @@ class BaseAnsatz(ABC):
         einsum_expr = f"{lhs}->{''.join(target_wires)}"
         return einsum_expr, tensor_arr
 
-    def compile_dataset(self, df, curry=False, spider=False):
+    def compile_dataset(self, df, curry=False, discard=False, spider=False):
         #blueprint_df = pd.DataFrame(index=df.index)
         cols = [col for col in df.columns if col.endswith('_diagram')]
         for col in cols:
@@ -211,6 +221,43 @@ class BaseAnsatz(ABC):
             df[symbols_col] = symbols_arr
         return df
                         
+class CustomV6Ansatz(BaseAnsatz):
+    def __init__(self, obmap=set(), layers=1):
+        super().__init__(obmap, layers)
+
+    def ansatz(self, current_wires, base_symbol):
+        new_indices, new_tensors = [], []
+        N = len(current_wires)
+
+        for i in range(N):
+            nxt = self.get_char()
+            new_indices.append(current_wires[i] + nxt)
+            new_tensors.append({'name': None, 'op_type': 'H'})
+            current_wires[i] = nxt
+
+        for l in range(self.layers):
+            op_idx = 0
+            for i in range(N):
+                gate_seq = ['Rx', 'Ry', 'Rx'] if (i == N - 1 and N > 1) else ['Rz', 'Ry', 'Rz']
+                for g in gate_seq:
+                    nxt = self.get_char()
+                    new_indices.append(current_wires[i] + nxt)
+                    new_tensors.append({'name': f"{base_symbol}_l{l}_{op_idx}", 'op_type': g})
+                    current_wires[i] = nxt
+                    op_idx += 1
+                    
+            if N > 1:
+                for i in range(N):
+                    c_idx, t_idx = i, (i + 1) % N
+                    c_out, t_out = self.get_char(), self.get_char()
+                    new_indices.append(current_wires[c_idx] + current_wires[t_idx] + c_out + t_out)
+
+                    cr_type = 'CRx' if (i == N - 1) else 'CRz'
+                    new_tensors.append({'name': f"{base_symbol}_ent_l{l}_{op_idx}", 'op_type': cr_type})
+                    current_wires[c_idx], current_wires[t_idx] = c_out, t_out
+                    op_idx += 1
+
+        return current_wires, new_indices, new_tensors
 
 class CustomV5Ansatz(BaseAnsatz):
     def __init__(self, obmap=set(), layers=1):
