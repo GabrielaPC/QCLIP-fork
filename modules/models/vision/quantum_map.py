@@ -193,8 +193,11 @@ class QuantumFeatureMap(nn.Module):
         if self.discard:
             pure_state = self.contraction_path(*tensor_arr)
             batch_dim = pure_state.shape[0]
-            pure_state = pure_state.reshape(batch_dim, 2**self.k, -1)
-            rho = torch.bmm(pure_state, pure_state.conj().transpose(1, 2))
+            k_latent = 3 
+            dim_latent = 2 ** k_latent
+            dim_env = pure_state.numel() // (batch_dim * dim_latent)
+            psi = pure_state.reshape(batch_dim, dim_latent, dim_env)
+            rho = torch.matmul(psi, psi.conj().transpose(1, 2))
             return rho
         else:
             return self.contraction_path(*tensor_arr)   
@@ -204,7 +207,11 @@ class QFMap_CPTP(nn.Module):
     def __init__(self, base_image_model: nn.Module, gamma: float = 0.3):
         super().__init__()
         self.image_model = base_image_model
-        self.gamma = gamma
+        out_dim = base_image_model.out_dim
+        self.gamma_head = nn.Sequential(
+            nn.Linear(out_dim, 1),
+            nn.Sigmoid()
+        )
 
     # --- Delegate Einsum Attributes & Methods to Base Feature Map ---
     @property
@@ -240,12 +247,13 @@ class QFMap_CPTP(nn.Module):
             D = img_emb.size(-1)
             rho = img_emb.to(torch.complex64)
 
+        gamma_x = (self.gamma_head(x.view(B, -1)) * 0.5).unsqueeze(-1).to(torch.complex64)
         # Construct maximally mixed identity matrix 1/d * I_d
         I_d = torch.eye(D, dtype=torch.complex64, device=img_emb.device).unsqueeze(0).expand(B, D, D)
         rho_mixed = (1.0 / D) * I_d
 
         # Apply Depolarizing Channel: (1 - gamma) * rho + gamma * (1/d * I)
-        rho_out = (1.0 - self.gamma) * rho + self.gamma * rho_mixed
+        rho_out = (1.0 - gamma_x) * rho + gamma_x * rho_mixed
 
         if len(orig_shape) == 2:
             return rho_out.view(B, D * D)

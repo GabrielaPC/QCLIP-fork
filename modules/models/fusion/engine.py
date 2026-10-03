@@ -272,12 +272,10 @@ class MMEvaluator:
     @torch.no_grad()
     def _encode_txt(self, texts):
         return self.text_model(texts).flatten(1).contiguous()
-        # return F.normalize(self.text_model(texts).flatten(1), dim=1)
     
     @torch.no_grad()
     def _encode_img(self, images):
         return self.image_model(images.to(self.device)).flatten(1).contiguous()
-        # return F.normalize(self.image_model(images.to(self.device)).flatten(1), dim=1)
     
     def _calculate_recall(self, scores: torch.Tensor, mask: torch.Tensor, prefix: str):
         rankings = scores.argsort(dim=1, descending=True)
@@ -447,41 +445,90 @@ class MMEvaluator:
         self.image_model.eval()
         self.text_model.eval()
 
-        sum_text_purity = 0.0
+        sum_m1_purity, sum_m1_entropy, sum_m1_eff_rank = 0.0, 0.0, 0.0
+        sum_m2_purity, sum_m2_entropy, sum_m2_eff_rank = 0.0, 0.0, 0.0
         total_samples = 0
         metrics = {}
+
+        def _to_density_matrix(emb: torch.Tensor) -> torch.Tensor:
+            B = emb.size(0)
+            if emb.dim() == 2:
+                D = int(math.sqrt(emb.size(1)))
+                return emb.view(B, D, D).to(torch.complex64)
+            return emb.to(torch.complex64)
+
+        def _compute_state_stats(rho: torch.Tensor):
+            # 1. Purity P = Tr(rho^2) computed natively on GPU
+            purity = torch.real(torch.einsum('bmn,bnm->b', rho, rho))
+
+            # 2. CPU Offloading for Hermitian Eigenvalues to avoid cuSOLVER/CUDA driver crashes
+            rho_cpu = rho.detach().cpu()
+            evals = torch.linalg.eigvalsh(rho_cpu).clamp(min=1e-8)
+
+            # 3. von Neumann Entropy S(rho) = -Tr(rho ln rho)
+            entropy = -(evals * torch.log(evals)).sum(dim=-1)
+
+            # 4. Effective Rank / Participation Ratio R_eff = 1 / Tr(rho^2)
+            eff_rank = 1.0 / (evals ** 2).sum(dim=-1)
+
+            return purity.sum().item(), entropy.sum().item(), eff_rank.sum().item()
 
         for batch in dataloader:
             if choice == "text":
                 m1_emb = self._encode_img(batch["image"])
                 pos_m2_emb = self._encode_txt(batch["pos_caption"])
                 neg_m2_emb = self._encode_txt(batch["neg_caption"])
-                text_tensors = [pos_m2_emb, neg_m2_emb]
             elif choice == "image":
                 m1_emb = self._encode_txt(batch["caption"])
                 pos_m2_emb = self._encode_img(batch["pos_image"])
                 neg_m2_emb = self._encode_img(batch["neg_image"])
-                text_tensors = [m1_emb]
 
-            batch_purity_sum = 0.0
-            for txt_emb in text_tensors:
-                B = txt_emb.size(0)
-                if txt_emb.dim() == 2:
-                    D = int(math.sqrt(txt_emb.size(1)))
-                    rho = txt_emb.view(B, D, D).to(torch.complex64)
-                else:
-                    rho = txt_emb.to(torch.complex64)
-                sample_purities = torch.real(torch.einsum('bmn,bnm->b', rho, rho))
-                batch_purity_sum += sample_purities.sum().item()
+            B = m1_emb.size(0)
+            rho_m1 = _to_density_matrix(m1_emb)
+            rho_m2_pos = _to_density_matrix(pos_m2_emb)
+            rho_m2_neg = _to_density_matrix(neg_m2_emb)
 
-            sum_text_purity += batch_purity_sum / len(text_tensors)
-            total_samples += m1_emb.size(0)
+            # Modality 1 statistics
+            m1_pur, m1_ent, m1_rank = _compute_state_stats(rho_m1)
+            sum_m1_purity += m1_pur
+            sum_m1_entropy += m1_ent
+            sum_m1_eff_rank += m1_rank
 
+            # Modality 2 statistics (averaged across positive and negative pairs)
+            m2_pos_pur, m2_pos_ent, m2_pos_rank = _compute_state_stats(rho_m2_pos)
+            m2_neg_pur, m2_neg_ent, m2_neg_rank = _compute_state_stats(rho_m2_neg)
+
+            sum_m2_purity += 0.5 * (m2_pos_pur + m2_neg_pur)
+            sum_m2_entropy += 0.5 * (m2_pos_ent + m2_neg_ent)
+            sum_m2_eff_rank += 0.5 * (m2_pos_rank + m2_neg_rank)
+
+            total_samples += B
 
         if total_samples == 0:
-                    return {}
-        
-        metrics["diag_mean_text_purity"] = sum_text_purity / total_samples
+            return {}
+
+        # Map modality identifiers based on query choice
+        m1_name = "img" if choice == "text" else "txt"
+        m2_name = "txt" if choice == "text" else "img"
+
+        mean_m1_pur = sum_m1_purity / total_samples
+        mean_m2_pur = sum_m2_purity / total_samples
+
+        # 1. Purities & Purity Imbalance Ratio
+        metrics[f"diag_mean_{m1_name}_purity"] = mean_m1_pur
+        metrics[f"diag_mean_{m2_name}_purity"] = mean_m2_pur
+        metrics["diag_purity_imbalance"] = abs(mean_m1_pur - mean_m2_pur)
+
+        # 2. von Neumann Entropies
+        metrics[f"diag_mean_{m1_name}_entropy"] = sum_m1_entropy / total_samples
+        metrics[f"diag_mean_{m2_name}_entropy"] = sum_m2_entropy / total_samples
+
+        # 3. Effective Ranks / Participation Ratios
+        metrics[f"diag_mean_{m1_name}_eff_rank"] = sum_m1_eff_rank / total_samples
+        metrics[f"diag_mean_{m2_name}_eff_rank"] = sum_m2_eff_rank / total_samples
+
+        # Legacy backward-compatibility key
+        metrics["diag_mean_text_purity"] = metrics["diag_mean_txt_purity"]
 
         return metrics
     

@@ -12,7 +12,7 @@ from modules.models.vision.quantum_map import QuantumFeatureMap, QFMap_CPTP
 from modules.models.vision.clip import FrozenCLIP
 from modules.models.vision.image_model import TTNImageModel
 
-from modules.models.fusion.criteria import FS_InfoNCE, InfoNCE, UJ_InfoNCE
+from modules.models.fusion.criteria import FS_InfoNCE, InfoNCE, UJ_InfoNCE, Pauli_InfoNCE, FS_InfoNCE
 import importlib
 
 def load_obj(import_str: str):
@@ -61,14 +61,12 @@ def build_experiment(config, device):
                                             id_init=False, 
                                             discard=config['discard'],
                                             method=config['vision']['method']).to(device)
-            if config['discard']:
-                image_model = QFMap_CPTP(base_image_model=image_model)
 
         text_model = VQCModel(out_q=config['embedding_qubits'], discard=config['discard']).to(device)
         if config['discard']:
-            loss_fn = UJ_InfoNCE(label_smoothing=0.1)
+            loss_fn = Pauli_InfoNCE(label_smoothing=0.1, temperature=0.07)
         else:
-            loss_fn = FS_InfoNCE(label_smoothing=0.1)
+            loss_fn = FS_InfoNCE(label_smoothing=0.1, temperature=0.07)
         
     elif model_type == "mlp":
         ansatz = MLPCompiler()

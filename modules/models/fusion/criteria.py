@@ -1,4 +1,4 @@
-import torch, math
+import torch, math, itertools
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Any, Tuple
@@ -134,7 +134,22 @@ class ExactSpectralMatrixSqrt(nn.Module):
 
         return sqrt_A.to(orig_device).reshape(orig_shape)
 
+class SafeArcsin(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, max_grad: float = 5.0) -> torch.Tensor:
+        x_clamped = torch.clamp(x, -0.999, 0.999)
+        ctx.save_for_backward(x_clamped)
+        ctx.max_grad = max_grad
+        return torch.asin(x_clamped)
 
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        x_clamped, = ctx.saved_tensors
+        min_denom = 1.0 / ctx.max_grad
+        denom = torch.sqrt(1.0 - x_clamped ** 2).clamp(min=min_denom)
+        
+        grad_x = grad_output / denom
+        return grad_x, None
 
 def complex_nan_to_num(z: torch.Tensor, nan: float = 0.0, posinf: float = 1.0, neginf: float = -1.0) -> torch.Tensor:
     real_part = torch.nan_to_num(z.real, nan=nan, posinf=posinf, neginf=neginf)
@@ -151,10 +166,7 @@ class BaseInfoNCELoss(nn.Module):
 
     def describe(self) -> None:
         hyperparams = self.get_hyperparams()
-        param_str = " | ".join([
-            f"| {k}: {v:.4f} " if isinstance(v, float) else f"| {k}: {v} " 
-            for k, v in hyperparams.items()
-        ])
+        param_str = " | ".join([f"{k}: {v}" for k, v in hyperparams.items()])
         print(f"{self.__class__.__name__} {param_str}")
 
     def get_hyperparams(self) -> Dict[str, Any]:
@@ -258,16 +270,6 @@ class HS_InfoNCE(BaseInfoNCELoss):
             return self.lambda_reg * txt_logits[mask].mean()
         return torch.tensor(0.0, device=text_emb.device)
 
-
-class MHS_InfoNCE(BaseInfoNCELoss):
-    def __init__(self, temperature: float = 0.07, label_smoothing: float = 0.0):
-        super().__init__(temperature=temperature, label_smoothing=label_smoothing)
-
-    def compute_similarity(self, text_emb: torch.Tensor, image_emb: torch.Tensor) -> torch.Tensor:
-        rho_text, rho_image, D = self._ensure_density_matrices(text_emb, image_emb)
-        raw_overlap = torch.real(torch.einsum('imn,jnm->ij', rho_text, rho_image))
-        return raw_overlap - (1.0 / D)
-
 class FS_InfoNCE(BaseInfoNCELoss):
     def __init__(self, temperature: float = 0.07, lambda_reg: float = 0.1, label_smoothing: float = 0.1, eps: float = 1e-7):
         super().__init__(temperature=temperature, label_smoothing=label_smoothing)
@@ -303,31 +305,63 @@ class UJ_InfoNCE(BaseInfoNCELoss):
     def __init__(self, temperature: float = 0.07, label_smoothing: float = 0.0, eps: float = 1e-7):
         super().__init__(temperature=temperature, label_smoothing=label_smoothing)
         self.eps = eps
-        self.sqrt_module = NS_Sqrt(iters=25, eps=1e-6)
+        self.sqrt_module = NS_Sqrt(iters=12, eps=1e-4)
 
     def get_hyperparams(self) -> Dict[str, Any]:
         hp = super().get_hyperparams()
         hp.update({"eps": self.eps, 
-                   "sqrt_engine": self.sqrt_module.__class__.__name__})
+                   "sqrt_engine": self.sqrt_module.__class__.__name__,
+                   "ns_iters": self.sqrt_module.iters,
+                   "ns_eps": self.sqrt_module.eps})
         return hp
 
     def compute_similarity(self, text_emb: torch.Tensor, image_emb: torch.Tensor) -> torch.Tensor:
         rho_text, rho_image, D = self._ensure_density_matrices(text_emb, image_emb)
         B = rho_text.size(0)
 
-        # 1. Compute exact sqrt(rho_text) -> [B, D, D]
         sqrt_rho_text = self.sqrt_module(rho_text)
-
-        # 2. Form transition matrix M_ij = sqrt(rho_i) @ sigma_j @ sqrt(rho_i) -> [B, B, D, D]
         M = sqrt_rho_text.unsqueeze(1) @ rho_image.unsqueeze(0) @ sqrt_rho_text.unsqueeze(1)
         M = 0.5 * (M + M.conj().transpose(-2, -1))
 
-        # 3. Sum sqrt singular values of M
         sqrt_M = self.sqrt_module(M.reshape(B * B, D, D)).reshape(B, B, D, D)
         tr_sqrt_M = torch.real(torch.diagonal(sqrt_M, dim1=-2, dim2=-1).sum(dim=-1))
+        fs_similarity = torch.asin(torch.clamp(tr_sqrt_M, 0.0, 1.0 - self.eps)) / (math.pi / 2.0)
 
-        # 4. Final fidelity
-        return torch.clamp(tr_sqrt_M ** 2, 0.0, 1.0)
+        return fs_similarity
+class Pauli_InfoNCE(BaseInfoNCELoss):
+    def __init__(self, temperature: float = 0.07, label_smoothing: float = 0.0, num_qubits: int = 3, eps: float = 1e-8):
+        super().__init__(temperature=temperature, label_smoothing=label_smoothing)
+        self.num_qubits = num_qubits
+        self.eps = eps
+        
+        I = torch.eye(2, dtype=torch.complex64)
+        X = torch.tensor([[0, 1], [1, 0]], dtype=torch.complex64)
+        Y = torch.tensor([[0, -1j], [1j, 0]], dtype=torch.complex64)
+        Z = torch.tensor([[1, 0], [0, -1]], dtype=torch.complex64)
+        paulis = [I, X, Y, Z]
+        
+        basis_list = []
+        for p_tuple in itertools.product(paulis, repeat=num_qubits):
+            if all(torch.equal(p, I) for p in p_tuple):
+                continue
+            p_tensor = p_tuple[0]
+            for p in p_tuple[1:]:
+                p_tensor = torch.kron(p_tensor, p)
+            basis_list.append(p_tensor)
+            
+        self.register_buffer("pauli_basis", torch.stack(basis_list), persistent=False)
 
-        # overlap_scaled = 0.5 + (0.5 * torch.clamp(tr_sqrt_M, 0.0, 1.0 - self.eps))
-        # return torch.asin(overlap_scaled) / (math.pi / 2) 
+    def _to_pauli_vector(self, rho: torch.Tensor) -> torch.Tensor:
+        pauli_vec = torch.real(torch.einsum('bmn, knm -> bk', rho, self.pauli_basis.to(rho.device)))
+        return pauli_vec
+
+    def compute_similarity(self, text_emb: torch.Tensor, image_emb: torch.Tensor) -> torch.Tensor:
+        rho_text, rho_image, _ = self._ensure_density_matrices(text_emb, image_emb)
+        
+        v_text = self._to_pauli_vector(rho_text)    # [B_txt, 63]
+        v_image = self._to_pauli_vector(rho_image)  # [B_img, 63]
+        
+        v_text_norm = torch.nn.functional.normalize(v_text, dim=-1, eps=self.eps)
+        v_image_norm = torch.nn.functional.normalize(v_image, dim=-1, eps=self.eps)
+        
+        return torch.matmul(v_text_norm, v_image_norm.T)
