@@ -2,6 +2,7 @@ mlflow.deb
 .DS_store
 .vscode/
 images/
+jobs/
 data/
 .data/
 data_compact/
